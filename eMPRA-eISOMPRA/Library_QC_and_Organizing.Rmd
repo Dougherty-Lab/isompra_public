@@ -1,0 +1,641 @@
+---
+title: "Library QC and Organizing"
+author: "Din Selmanovic"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+---
+
+<!--
+Library QC and Organizing
+--------------------------
+This document is the quality-control (QC) and data-organizing step of the
+in vivo / in vitro MPRA pipeline. It takes the raw per-sample alignment count
+tables produced by the upstream alignment/counting bash scripts and:
+
+  1. Reads in and harmonizes the ISO-MPRA (splicing-aware) count tables and the
+     eMPRA (barcode-level) count tables.
+  2. Computes per-sample alignment / counting QC metrics.
+  3. Computes replicate-to-replicate correlations as a sanity check.
+  4. Reshapes everything into the long 'UTR' format and writes the .rds / .csv
+     files that the downstream analysis notebook consumes.
+
+Expected inputs (in the working directory):
+  - ms*.txt              : ISO-MPRA per-sample count tables (ID + count)
+  - *_foundBCs.txt       : eMPRA found-barcode lists, one per sample
+  - trevino.names.csv    : barcode <-> rsID map for the eMPRA library
+  - nreads.txt           : total read counts per ISO-MPRA sample
+  - nreads.empra.txt     : total read counts per eMPRA sample
+  - corr.values.trevino*.csv : pre-computed correlation summaries for plotting
+  - meta.file3.trev.rds  : library metadata (barcode_allele -> ref/alt)
+
+Outputs:
+  - reads.table.trevino.isompra.csv / reads.table.trevino.empra.csv (QC tables)
+  - invivo.ps1.utr.format.*.rds/csv  (ISO-MPRA long format)
+  - empratrev.utr.format.*.rds/csv   (eMPRA long format)
+  - corr.*.csv (replicate correlation matrices)
+
+NOTE: a couple of chunks read a library-metadata file from an absolute Windows
+path (C:/Users/dinse/...). Update that path before running on another machine.
+-->
+
+```{r setup, include=FALSE}
+# Global knitr options: show code, but hide package start-up warnings/messages.
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Setup
+
+## Packages and helper functions
+
+Load the packages used throughout the QC pipeline and define a few small helper
+functions for reshaping correlation matrices, cleaning element IDs, and
+converting raw counts to counts-per-million (CPM).
+
+```{r load-packages-and-helpers, include=FALSE}
+library(Biostrings)
+library(tidyr)
+library(ggplot2)
+library(data.table)
+library(dplyr)
+library(readr)
+library(stringr)
+library(mgsub)
+library(psych)
+library(Hmisc)
+library(limma)
+library(data.table)
+library(ggpmisc)
+
+flattenCorrMatrix <- function(cormat, pmat) {
+  ut <- upper.tri(cormat)
+  data.frame(
+    row = rownames(cormat)[row(cormat)[ut]],
+    column = rownames(cormat)[col(cormat)[ut]],
+    cor  =(cormat)[ut],
+    p = pmat[ut]
+    )
+}
+#To get this to work with downstream stuff, I need to remove the "=*" portions
+extract_and_replace <- function(x) {
+  rs_numbers <- str_extract_all(x, "rs\\d+")
+  if (length(rs_numbers) > 0) {
+    str_replace_all(x, ".*?(rs\\d+).*", "\\1")
+  } else {
+    x
+  }
+}
+
+apply_operation <- function(data, column_names) {
+  for (col_name in column_names) {
+    # Calculate the sum for the specified column
+    col_sum <- sum(data[[col_name]])
+    # Apply the operation to the column
+    data[, paste0(col_name, ".cpm") := (data[[col_name]] / col_sum) * 1e6]
+  }
+  return(data)
+}
+```
+
+# Reading and assembling count tables
+
+## ISO-MPRA count tables
+
+Read every `ms*.txt` ISO-MPRA count table, standardize the element IDs (strip
+alignment prefixes, tag the scrambled/control elements), sum the technical
+re-sequencing runs (e.g. `ms1` + `ms1.1`) into a single post-splice count, then
+merge all samples into a single wide `merged_data` table keyed by `rsID`.
+
+```{r assemble-isompra-counts, include=FALSE}
+#The following is now going to bring in the ISOMPRA format files which are already in a table as the bash script aligns and then counts for us.
+files <- list.files(pattern = "ms.*.txt")
+files <- files[!grepl("foundBCS\\.txt",files)]
+# Loop through each file
+for (file in files) {
+  # Read the data from the file (adjust read.table parameters as needed)
+  data <- fread(file, header = TRUE, fill = TRUE)
+  # Apply the specified transformations to the 'ID' column
+  data$ID <- sub(".*\\|", "", data$ID)
+  data$ID <- ifelse(grepl("^ X", data$ID), paste0("trevino.ctrl", data$ID), data$ID)
+  data$ID <- sub("trevino.ctrl\\s*X", "trevino.ctrlX", data$ID)
+  data$ID <- gsub("\\s+", "", data$ID)
+  data$ID <- as.character(data$ID)
+  data$ID <- ifelse(grepl("rs\\d+", data$ID) & !grepl("=", data$ID),
+                    paste0("scrambled", data$ID), data$ID)
+  # Save the modified data to the environment with a unique name
+  assign(paste0("modified_", tools::file_path_sans_ext(file)), data)
+}
+
+modified_ms1.post$count<-modified_ms1.post$count+modified_ms1.1.post$count
+modified_ms2.post$count <- modified_ms2.post$count + modified_ms2.1.post$count
+modified_ms3.post$count <- modified_ms3.post$count + modified_ms3.1.post$count
+modified_ms4.post$count <- modified_ms4.post$count + modified_ms4.1.post$count
+modified_ms5.post$count <- modified_ms5.post$count + modified_ms5.1.post$count
+modified_ms8.post$count <- modified_ms8.post$count + modified_ms8.1.post$count
+modified_ms12.post$count <- modified_ms12.post$count + modified_ms12.1.post$count
+modified_ms13.post$count <- modified_ms13.post$count + modified_ms13.1.post$count
+modified_ms14.post$count <- modified_ms14.post$count + modified_ms14.1.post$count
+modified_ms15.post$count <- modified_ms15.post$count + modified_ms15.1.post$count
+modified_ms17.post$count <- modified_ms17.post$count + modified_ms17.1.post$count
+modified_ms18.post$count <- modified_ms18.post$count + modified_ms18.1.post$count
+modified_ms19.post$count <- modified_ms19.post$count + modified_ms19.1.post$count
+modified_ms20.post$count <- modified_ms20.post$count + modified_ms20.1.post$count
+modified_ms21.post$count <- modified_ms21.post$count + modified_ms21.1.post$count
+modified_ms22.post$count <- modified_ms22.post$count + modified_ms22.1.post$count
+
+rm(modified_ms1.1.post, modified_ms2.1.post, modified_ms3.1.post, modified_ms4.1.post, 
+   modified_ms5.1.post, modified_ms8.1.post, modified_ms12.1.post, modified_ms13.1.post, 
+   modified_ms14.1.post, modified_ms15.1.post, modified_ms17.1.post, modified_ms18.1.post, 
+   modified_ms19.1.post, modified_ms20.1.post, modified_ms21.1.post, modified_ms22.1.post)
+
+objects <- ls(pattern = "modified_")
+
+# Initialize an empty list to store data.tables
+data_tables <- list()
+
+# Loop through each object with "modified" in its name
+for (object in objects) {
+  # Convert the object to a data.table
+  dt <- as.data.table(get(object))
+  
+  # Add the data.table to the list
+  data_tables[[object]] <- dt
+}
+
+# Merge data.tables by 'ID'
+merged_data <- data_tables[[1]]  # Initialize with the first data.table
+for (i in seq_along(data_tables)[-1]) {
+  # Merge each subsequent data.table
+  merged_data <- merge(merged_data, data_tables[[i]], by = "ID", all = TRUE, suffixes = c("", paste0("_", objects[i])))
+}
+
+#Renaming the merged file
+names(merged_data)<-c("rsID","ms1","ms12","ms13","ms14","ms15","ms17","ms18","ms19","ms2","ms20","ms21","ms22","ms3","ms4","ms5","ms6","ms7","ms8","ms9","aav","plasmid","ms1.post","ms12.post","ms13.post","ms14.post","ms15.post","ms17.post","ms18.post","ms19.post","ms2.post","ms20.post","ms21.post","ms22.post","ms3.post","ms4.post","ms5.post","ms8.post")
+
+#Bringing in the total reads so that we can align and count how many percent aligned
+totalreads<-fread("nreads.txt")
+
+rm(dt,data_tables,data,curcounts,curfinds,modified_ms.1,modified_ms.12,modified_ms.13,modified_ms.14,modified_ms.15,modified_ms.17,modified_ms.18,modified_ms.19,modified_ms.2,modified_ms.20,modified_ms.21,modified_ms.22,modified_ms.3,modified_ms.4,modified_ms.5,modified_ms.6,modified_ms.7,modified_ms.8,modified_ms.9,modified_ms.aav,modified_ms.plasmid)
+
+rm(modified_ms1.post, modified_ms2.post, modified_ms3.post, modified_ms4.post, 
+   modified_ms5.post, modified_ms8.post, modified_ms12.post, modified_ms13.post, 
+   modified_ms14.post, modified_ms15.post, modified_ms17.post, modified_ms18.post, 
+   modified_ms19.post, modified_ms20.post, modified_ms21.post, modified_ms22.post)
+```
+
+## eMPRA barcode count tables
+
+Read the per-sample found-barcode lists, reverse-complement the barcodes so they
+match the library orientation, associate each barcode with its element via
+`trevino.names.csv`, and sum technical re-sequencing runs into one count per
+sample. The result is `SIC_countstrevino`, a wide barcode-level count table.
+
+```{r assemble-empra-counts, include=FALSE}
+#These lines of code read in the found BCs and then rev comp them to match the library so we can associate the BC with the correct Element
+SIC_countstrevino<-fread("trevino.names.csv",header=F,fill=T)
+colnames(SIC_countstrevino)<-c("revcomp_barcode","rsID")
+SIC_countstrevino$revcomp_barcode<- sapply(SIC_countstrevino$revcomp_barcode, function(x) as.character(reverseComplement(DNAString(x))))
+bcfinds <- list.files(pattern='BCS.txt',full.names = TRUE)
+i<-1
+for (i in c(1:length(bcfinds))){  
+  curfinds <- fread(paste0(bcfinds[i]),header=FALSE)  
+  curcounts <- as.data.table(table(curfinds))  
+  setnames(curcounts,c(1:2),c("revcomp_barcode", gsub(bcfinds[i],pattern="^(.*)_foundBCs.txt",replacement="\\1")))  
+  SIC_countstrevino <- merge.data.table(curcounts,SIC_countstrevino,by="revcomp_barcode",all.y=TRUE)
+}
+
+rm(curcounts,curfinds)
+
+SIC_counts2<-SIC_countstrevino
+
+SIC_counts2$aav <- SIC_counts2$'./aav.fastq_foundBCS.txt' + SIC_counts2$'./aav.fastq_foundBCS.txt'
+SIC_counts2$ms1 <- SIC_counts2$'./ms1.fastq_foundBCS.txt' + SIC_counts2$'./ms1.1.fastq_foundBCS.txt'
+SIC_counts2$ms2 <- SIC_counts2$'./ms2.fastq_foundBCS.txt' + SIC_counts2$'./ms2.1.fastq_foundBCS.txt'
+SIC_counts2$ms3 <- SIC_counts2$'./ms3.fastq_foundBCS.txt' + SIC_counts2$'./ms3.1.fastq_foundBCS.txt'
+SIC_counts2$ms4 <- SIC_counts2$'./ms4.fastq_foundBCS.txt' + SIC_counts2$'./ms4.1.fastq_foundBCS.txt'
+SIC_counts2$ms5 <- SIC_counts2$'./ms5.fastq_foundBCS.txt' + SIC_counts2$'./ms5.1.fastq_foundBCS.txt'
+SIC_counts2$ms6 <- SIC_counts2$'./ms6.fastq_foundBCS.txt' + SIC_counts2$'./ms6.1.fastq_foundBCS.txt'
+SIC_counts2$ms7 <- SIC_counts2$'./ms7.fastq_foundBCS.txt' + SIC_counts2$'./ms7.1.fastq_foundBCS.txt'
+SIC_counts2$ms8 <- SIC_counts2$'./ms8.fastq_foundBCS.txt' + SIC_counts2$'./ms8.1.fastq_foundBCS.txt'
+SIC_counts2$ms8.2 <- SIC_counts2$'./ms8.2.fastq_foundBCS.txt' + SIC_counts2$'./ms8.2.1.fastq_foundBCS.txt'
+SIC_counts2$ms9 <- SIC_counts2$'./ms9.fastq_foundBCS.txt' + SIC_counts2$'./ms9.1.fastq_foundBCS.txt'
+SIC_counts2$ms10 <- SIC_counts2$'./ms10.fastq_foundBCS.txt' + SIC_counts2$'./ms10.1.fastq_foundBCS.txt'
+SIC_counts2$ms11 <- SIC_counts2$'./ms11.fastq_foundBCS.txt' + SIC_counts2$'./ms11.1.fastq_foundBCS.txt'
+SIC_counts2$ms12 <- SIC_counts2$'./ms12.fastq_foundBCS.txt' + SIC_counts2$'./ms12.1.fastq_foundBCS.txt'
+SIC_counts2$ms13 <- SIC_counts2$'./ms13.fastq_foundBCS.txt' + SIC_counts2$'./ms13.1.fastq_foundBCS.txt'
+SIC_counts2$ms14 <- SIC_counts2$'./ms14.fastq_foundBCS.txt' + SIC_counts2$'./ms14.1.fastq_foundBCS.txt'
+SIC_counts2$ms15 <- SIC_counts2$'./ms15.fastq_foundBCS.txt' + SIC_counts2$'./ms15.1.fastq_foundBCS.txt'
+SIC_counts2$ms16 <- SIC_counts2$'./ms16.fastq_foundBCS.txt' + SIC_counts2$'./ms16.1.fastq_foundBCS.txt'
+SIC_counts2$ms17 <- SIC_counts2$'./ms17.fastq_foundBCS.txt' + SIC_counts2$'./ms17.1.fastq_foundBCS.txt'
+SIC_counts2$ms18 <- SIC_counts2$'./ms18.fastq_foundBCS.txt' + SIC_counts2$'./ms18.1.fastq_foundBCS.txt'
+SIC_counts2$ms19 <- SIC_counts2$'./ms19.fastq_foundBCS.txt' + SIC_counts2$'./ms19.1.fastq_foundBCS.txt'
+SIC_counts2$ms20 <- SIC_counts2$'./ms20.fastq_foundBCS.txt' + SIC_counts2$'./ms20.1.fastq_foundBCS.txt'
+SIC_counts2$ms21 <- SIC_counts2$'./ms21.fastq_foundBCS.txt' + SIC_counts2$'./ms21.1.fastq_foundBCS.txt'
+SIC_counts2$ms22 <- SIC_counts2$'./ms22.fastq_foundBCS.txt' + SIC_counts2$'./ms22.1.fastq_foundBCS.txt'
+SIC_counts2$plasmid <- SIC_counts2$'./plasmid.fastq_foundBCS.txt' + SIC_counts2$'./plasmid.1.fastq_foundBCS.txt'
+
+
+SIC_countstrevino<-SIC_counts2[,c(1,54:61,63:77,53,52)]
+
+totalreads.empra<-fread("nreads.empra.txt")
+
+rm(SIC_counts2)
+```
+
+# Alignment QC
+
+## ISO-MPRA percent alignment
+
+For each ISO-MPRA sample, compute reads aligned, percent aligned (aligned /
+total reads), and the fraction of the 466 library elements that were detected.
+
+```{r qc-percent-alignment-isompra, include=TRUE}
+trevino.meta.file<-read_csv("trevino.names.csv",col_names=F)
+
+trevino.meta.file<-trevino.meta.file[,c(2)]
+trevino.meta.file<-distinct(trevino.meta.file)
+names(trevino.meta.file)<-c("rsID")
+trevino<-merged_data
+trevino[trevino == 0] <- NA
+trevino<-inner_join(trevino.meta.file,trevino,by="rsID")
+
+mappedcounts<-as.data.table(colSums(trevino[,c(2:38)],na.rm=T),keep.rownames=T)
+names(mappedcounts)<-c("sample","V2")
+totalreadsout<-merge.data.table(totalreads,mappedcounts,by="sample")
+
+setnames(totalreadsout,3,"reads_aligned")
+totalreadsout[,pctalign:=(reads_aligned/counts)*100]
+
+i<-0
+for (i in c(0:nrow(totalreadsout))){  
+  cursample <- names(trevino)[i+1]  
+  counted <- sum(!is.na(trevino[,(i+1),with=FALSE])) 
+  totalreadsout[sample==cursample, BCs_counted:=counted]
+  totalreadsout[sample == cursample, pctElems_Counted := counted / 466 * 100]
+}
+
+totalreadsout.trevino.isompra<-totalreadsout
+print(totalreadsout.trevino.isompra)
+write.csv(totalreadsout.trevino.isompra,"reads.table.trevino.isompra.csv")
+
+rm(mappedcounts,totalreadsout)
+```
+
+## eMPRA percent alignment
+
+Same QC metrics for the eMPRA samples (here the denominator is the ~9,400
+barcodes in the library), plus a sanity-check boxplot of the pre-computed
+replicate correlation values.
+
+```{r qc-percent-alignment-empra, include=TRUE}
+mappedcounts<-as.data.table(colSums(SIC_countstrevino[,c(2:25)],na.rm=T),keep.rownames=T)
+names(mappedcounts)<-c("sample","V2")
+totalreadsout<-merge.data.table(totalreads.empra,mappedcounts,by="sample")
+
+setnames(totalreadsout,3,"reads_aligned")
+totalreadsout[,pctalign:=(reads_aligned/counts)*100]
+
+i<-1
+for (i in c(1:nrow(totalreadsout))){  
+  cursample <- names(SIC_countstrevino)[i+1]  
+  counted <- sum(!is.na(SIC_countstrevino[,(i+1),with=FALSE]))  
+  totalreadsout[sample==cursample, BCs_counted:=counted]
+  totalreadsout[sample == cursample, pctBCs_Counted := counted / 9400 * 100]
+}
+
+totalreadsout.trevino<-totalreadsout
+print(totalreadsout.trevino)
+write.csv(totalreadsout.trevino,"reads.table.trevino.empra.csv")
+
+corr.values.trevino.sanity <- read_csv("corr.values.trevino.sanity.csv")
+
+ggplot(corr.values.trevino.sanity,aes(x=factor(MPRA),y=Value,fill=factor(MPRA)))+geom_boxplot()+geom_dotplot(binaxis='y',stackdir='center',position=position_dodge(0.75),dotsize=0.5)+facet_wrap(.~Type,scale="free_y")+scale_fill_manual(values=c("#E1BE6A","#8e3636","#8E3636")) + theme(legend.position = "bottom")
+```
+
+# Replicate correlations
+
+## ISO-MPRA replicate correlations
+
+Drop elements with any zero counts, convert to CPM, and look at replicate
+agreement both on the CPM scale and on the log2 expression scale
+(log2(RNA CPM / AAV DNA CPM)). Correlation matrices are written to disk and an
+MDS plot summarizes overall replicate structure.
+
+```{r correlations-isompra, include=TRUE}
+trevino<-merged_data
+trevino<-trevino[,c(1:15,17:19,21,23:38)]
+
+trevino <- trevino[rowSums(trevino[,2:35] == 0) == 0, ]
+columns_list <- colnames(trevino)[-which(colnames(trevino) == "rsID")]
+trevino<-apply_operation(trevino, columns_list)
+
+pairs.panels(trevino[,c(36:69)], 
+             method = "spearman", # correlation method
+             hist.col = "#00AFBB",
+             density = TRUE,  # show density plots
+             ellipses = TRUE,
+             lm=T,
+             pch="."
+             )
+
+cor_matrix <- cor(trevino[,c(36:69)], use = "pairwise.complete.obs",method="spearman")
+
+# Convert to a data frame
+cor_df <- as.data.frame(cor_matrix)
+
+# Save as CSV
+write.csv(cor_df, file = "corr.isompra.trevino.cpm.csv", row.names = TRUE)
+
+cpm_columns <- grep("cpm", colnames(trevino), value = TRUE)
+# Loop through cpm columns and apply the operation
+for (col_name in cpm_columns) {
+  # Extract the corresponding column name from 'merged_data'
+  expr_column <- gsub("cpm", "expr", col_name)
+  
+  # Apply the operation to the column
+    trevino[, paste0(col_name, ".expr") := (log2(trevino[[col_name]] / trevino$aav.cpm))]
+}
+
+
+pairs.panels(trevino[,c(70:86,88:103)], 
+             method = "spearman", # correlation method
+             hist.col = "#00AFBB",
+             density = TRUE,  # show density plots
+             ellipses = TRUE,
+             lm=T,
+             pch="."
+             )
+
+cor_matrix <- cor(trevino[,c(70:86,88:103)], use = "pairwise.complete.obs",method="spearman")
+
+# Convert to a data frame
+cor_df <- as.data.frame(cor_matrix)
+
+# Save as CSV
+write.csv(cor_df, file = "corr.isompra.trevino.expr.csv", row.names = TRUE)
+
+data_for_mds.expr<-trevino[,c(36:69)]
+mds_result.expr<-plotMDS(data_for_mds.expr)
+```
+
+## eMPRA replicate correlations
+
+The eMPRA equivalent: filter to fully-observed barcodes, convert to CPM, compute
+log2 expression relative to the AAV plasmid DNA, and summarize replicate
+agreement with `pairs.panels`, correlation matrices, an MDS plot, and the
+cross-MPRA correlation summary plots.
+
+```{r correlations-empra, include=TRUE}
+SIC_counts2<-SIC_countstrevino[rowSums(is.na(SIC_countstrevino[,2:25]))==0,]
+tmp<-SIC_countstrevino[,c(1:11,13:14,16:19,23:26)]
+tmp<-tmp[rowSums(is.na(tmp[,c(2:20)]))==0]
+
+
+setDT(SIC_counts2)
+setDT(tmp)
+cols<-c("ms1","ms2","ms3","ms4","ms5","ms6","ms7","ms8","ms9","ms10","ms11","ms12","ms13","ms14","ms15","ms16","ms17","ms18","ms19","ms20","ms21","ms22","plasmid","aav")
+
+
+for (col in cols) {
+  SIC_counts2[, paste0(col, "_cpm") := (.SD[[col]]/sum(.SD[[col]])) * 1e6, .SDcols = col]
+}
+
+cols<-c("ms1","ms2","ms3","ms4","ms5","ms6","ms7","ms8","ms9","ms10","ms12","ms13","ms15","ms16","ms17","ms18","ms22","plasmid","aav")
+
+for (col in cols) {
+  tmp[, paste0(col, "_cpm") := (.SD[[col]]/sum(.SD[[col]])) * 1e6, .SDcols = col]
+}
+
+
+pairs.panels(SIC_counts2[,c(27:50)], 
+             method = "spearman", # correlation method
+             hist.col = "#00AFBB",
+             density = TRUE,  # show density plots
+             ellipses = TRUE,
+             lm=T,
+             pch="."
+             )
+
+pairs.panels(tmp[,c(22:40)], 
+             method = "spearman", # correlation method
+             hist.col = "#00AFBB",
+             density = TRUE,  # show density plots
+             ellipses = TRUE,
+             lm=T,
+             pch="."
+             )
+
+cor_matrix <- cor(tmp[,c(22:40)], use = "pairwise.complete.obs",method="spearman")
+
+# Convert to a data frame
+cor_df <- as.data.frame(cor_matrix)
+
+# Save as CSV
+write.csv(cor_df, file = "corr.empra.trevino.cpm.csv", row.names = TRUE)
+
+
+#Calculating Raw Expression from Plasmid DNA
+
+cols <- c("ms1_cpm","ms2_cpm","ms3_cpm","ms4_cpm","ms5_cpm","ms6_cpm","ms7_cpm","ms8_cpm","ms9_cpm","ms10_cpm","ms11_cpm","ms12_cpm","ms13_cpm","ms14_cpm","ms15_cpm","ms16_cpm","ms17_cpm","ms18_cpm","ms19_cpm","ms20_cpm","ms21_cpm","ms22_cpm")
+
+
+for (col in cols) {
+  col_log <- log2(SIC_counts2[, .SD[[col]]/SIC_counts2[, "aav_cpm"]])
+  col_name <- paste0(col, ".expr.aav")
+  SIC_counts2[, (col_name) := col_log]
+}
+
+cols <- c("ms1_cpm","ms2_cpm","ms3_cpm","ms4_cpm","ms5_cpm","ms6_cpm","ms7_cpm","ms8_cpm","ms9_cpm","ms10_cpm","ms12_cpm","ms13_cpm","ms15_cpm","ms16_cpm","ms17_cpm","ms18_cpm","ms22_cpm")
+
+
+for (col in cols) {
+  col_log <- log2(tmp[, .SD[[col]]/tmp[, "aav_cpm"]])
+  col_name <- paste0(col, ".expr.aav")
+  tmp[, (col_name) := col_log]
+}
+
+pairs.panels(SIC_counts2[,c(51:72)], 
+             method = "spearman", # correlation method
+             hist.col = "seagreen",
+             density = TRUE,  # show density plots
+             ellipses = TRUE,
+             lm=T,
+             pch="."# show correlation ellipses
+             )
+
+pairs.panels(tmp[,c(41:57)], 
+             method = "spearman", # correlation method
+             hist.col = "seagreen",
+             density = TRUE,  # show density plots
+             ellipses = TRUE,
+             lm=T,
+             pch="."# show correlation ellipses
+             )
+
+cor_matrix <- cor(tmp[,c(41:57)], use = "pairwise.complete.obs",method="spearman")
+
+# Convert to a data frame
+cor_df <- as.data.frame(cor_matrix)
+
+# Save as CSV
+write.csv(cor_df, file = "corr.empra.trevino.expr.csv", row.names = TRUE)
+
+
+data_for_mds.expr<-tmp[,c(2:20)]
+mds_result.expr<-plotMDS(data_for_mds.expr)
+
+corr.values.trevino <- read_csv("corr.values.trevino.csv")
+
+ggplot(corr.values.trevino,aes(x=factor(CorrType),y=Value,fill=factor(Sample)))+geom_jitter(aes(shape=factor(MPRA),color=factor(Sample),size=4),width = 0.1)
+
+ggplot(corr.values.trevino,aes(x=factor(MPRA),y=Value,fill=factor(CorrType)))+geom_boxplot()+geom_dotplot(binaxis='y',stackdir='center',position=position_dodge(0.75),dotsize=0.5)+scale_fill_manual(values=c("#E1BE6A","#40B0A6"))
+
+ggplot(corr.values.trevino,aes(x=factor(MPRA),y=Value,fill=factor(MPRA)))+geom_boxplot()+geom_dotplot(binaxis='y',stackdir='center',position=position_dodge(0.75),dotsize=0.5)+scale_fill_manual(values=c("#8E3636","#E1BE6A","#E1BE6A"))+facet_wrap(.~CorrType,scale="free_y")
+```
+
+# Reshaping to long 'UTR' format
+
+These final chunks convert the wide count tables into the long format expected by
+the downstream analysis notebook (one row per element x replicate, with raw
+counts and CPM), attach the ref/alt allele annotation from the library metadata,
+and write the `.rds`/`.csv` files.
+
+## ISO-MPRA long format
+
+```{r utr-format-isompra, include=FALSE}
+# NOTE: meta.file3.trev.rds is read from an absolute path; update for your machine.
+meta.file3.trev <- readRDS("C:/Users/dinse/Desktop/ISOMPRA/ps1.isompra.mgi/meta.file3.trev.rds")
+metatab.reformatted<-meta.file3.trev[,c(6,10)]
+
+pivotedsic<-trevino[,c(1:2,10,14:18,3:9,11:13,20,28,32:35,21:27,29:31,19)]
+
+pivoted_long <- pivot_longer(pivotedsic, cols = c(2:35), names_to = "Replicate", values_to = "Value")
+pivoted_long <- pivoted_long %>%
+  dplyr::group_by(rsID) %>%
+  dplyr::arrange(rsID)
+
+pivoted_long <- pivoted_long %>%
+  dplyr::mutate(Replicate = ifelse(Replicate %in% c("ms1","ms2","ms3","ms4","ms6","ms7","ms8","ms12","ms13","ms14","ms15","ms17","ms18","ms19","ms20","ms21","ms22","ms1.post","ms2.post","ms3.post","ms4.post","ms5.post","ms8.post","ms12.post","ms13.post","ms14.post","ms15.post","ms17.post","ms18.post","ms19.post","ms20.post","ms21.post","ms22.post"), match(Replicate, c("ms1","ms2","ms3","ms4","ms6","ms7","ms8","ms12","ms13","ms14","ms15","ms17","ms18","ms19","ms20","ms21","ms22","ms1.post","ms2.post","ms3.post","ms4.post","ms5.post","ms8.post","ms12.post","ms13.post","ms14.post","ms15.post","ms17.post","ms18.post","ms19.post","ms20.post","ms21.post","ms22.post")), Replicate))
+
+pivoted_long <- pivoted_long %>%
+  dplyr::mutate(
+    Replicate = ifelse(Replicate %in% c("ms1","ms2","ms3","ms4","ms6","ms7","ms8","ms12","ms13","ms14","ms15","ms17","ms18","ms19","ms20","ms21","ms22","ms1.post","ms2.post","ms3.post","ms4.post","ms5.post","ms8.post","ms12.post","ms13.post","ms14.post","ms15.post","ms17.post","ms18.post","ms19.post","ms20.post","ms21.post","ms22.post"), match(Replicate, c("ms1","ms2","ms3","ms4","ms6","ms7","ms8","ms12","ms13","ms14","ms15","ms17","ms18","ms19","ms20","ms21","ms22","ms1.post","ms2.post","ms3.post","ms4.post","ms5.post","ms8.post","ms12.post","ms13.post","ms14.post","ms15.post","ms17.post","ms18.post","ms19.post","ms20.post","ms21.post","ms22.post")), Replicate),
+    BiolRep = ifelse(Replicate %in% c("1", "2", "3","4","5","6","7","8","9","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24","25","26","27","28","29","30","31","32","33"), "rna.total", 
+                      ifelse(Replicate == "aav", "dna.total", NA_character_))
+  )
+
+pivotedsic2<-trevino[,c(1,36,44,48:52,37:43,45:47,54,62,66:69,55:61,63:65,53)]
+
+pivoted_long2 <- pivot_longer(pivotedsic2, cols = c(2:35), names_to = "Replicate", values_to = "Value")
+pivoted_long2 <- pivoted_long2 %>%
+  dplyr::group_by(rsID) %>%
+  dplyr::arrange(rsID)
+
+pivoted_long2 <- pivoted_long2 %>%
+  mutate(Replicate = ifelse(Replicate %in% c("ms1.cpm","ms2.cpm","ms3.cpm","ms4.cpm","ms6.cpm","ms7.cpm","ms8.cpm","ms12.cpm","ms13.cpm","ms14.cpm","ms15.cpm","ms17.cpm","ms18.cpm","ms19.cpm","ms20.cpm","ms21.cpm","ms22.cpm","ms1.post.cpm","ms2.post.cpm","ms3.post.cpm","ms4.post.cpm","ms5.post.cpm","ms8.post.cpm","ms12.post.cpm","ms13.post.cpm","ms14.post.cpm","ms15.post.cpm","ms17.post.cpm","ms18.post.cpm","ms19.post.cpm","ms20.post.cpm","ms21.post.cpm","ms22.post.cpm"
+), match(Replicate, c("ms1.cpm","ms2.cpm","ms3.cpm","ms4.cpm","ms6.cpm","ms7.cpm","ms8.cpm","ms12.cpm","ms13.cpm","ms14.cpm","ms15.cpm","ms17.cpm","ms18.cpm","ms19.cpm","ms20.cpm","ms21.cpm","ms22.cpm","ms1.post.cpm","ms2.post.cpm","ms3.post.cpm","ms4.post.cpm","ms5.post.cpm","ms8.post.cpm","ms12.post.cpm","ms13.post.cpm","ms14.post.cpm","ms15.post.cpm","ms17.post.cpm","ms18.post.cpm","ms19.post.cpm","ms20.post.cpm","ms21.post.cpm","ms22.post.cpm"
+)), Replicate))
+
+pivoted_long2 <- pivoted_long2 %>%
+  mutate(
+    Replicate = ifelse(Replicate %in% c("ms1.cpm","ms2.cpm","ms3.cpm","ms4.cpm","ms6.cpm","ms7.cpm","ms8.cpm","ms12.cpm","ms13.cpm","ms14.cpm","ms15.cpm","ms17.cpm","ms18.cpm","ms19.cpm","ms20.cpm","ms21.cpm","ms22.cpm","ms1.post.cpm","ms2.post.cpm","ms3.post.cpm","ms4.post.cpm","ms5.post.cpm","ms8.post.cpm","ms12.post.cpm","ms13.post.cpm","ms14.post.cpm","ms15.post.cpm","ms17.post.cpm","ms18.post.cpm","ms19.post.cpm","ms20.post.cpm","ms21.post.cpm","ms22.post.cpm"
+), match(Replicate, c("ms1.cpm","ms2.cpm","ms3.cpm","ms4.cpm","ms6.cpm","ms7.cpm","ms8.cpm","ms12.cpm","ms13.cpm","ms14.cpm","ms15.cpm","ms17.cpm","ms18.cpm","ms19.cpm","ms20.cpm","ms21.cpm","ms22.cpm","ms1.post.cpm","ms2.post.cpm","ms3.post.cpm","ms4.post.cpm","ms5.post.cpm","ms8.post.cpm","ms12.post.cpm","ms13.post.cpm","ms14.post.cpm","ms15.post.cpm","ms17.post.cpm","ms18.post.cpm","ms19.post.cpm","ms20.post.cpm","ms21.post.cpm","ms22.post.cpm"
+)), Replicate),
+    BiolRep = ifelse(Replicate %in% c("1", "2", "3","4","5","6","7","8","9","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24","25","26","27","28","29","30","31","32","33"), "rna.total", 
+                      ifelse(Replicate == "aav.cpm", "dna.total", NA_character_))
+  )
+
+pivoted_long2$Replicate[pivoted_long2$Replicate == "aav.cpm"] <- "aav"
+merged_df <- inner_join(pivoted_long,pivoted_long2,by=c("rsID","Replicate"))
+merged_df<-merged_df[,c(1:3,5,4)]
+names(merged_df)<-c("Element","BiolRep","Counts","CPM","Fraction")
+metatab.reformatted$barcode_allele <- gsub("_", "=", metatab.reformatted$barcode_allele)
+names(metatab.reformatted)<-c("ref,alt","Element")
+merged_df$Element <- gsub("scrambled*", "scrambled=", merged_df$Element)
+merged_df<-right_join(metatab.reformatted,merged_df,by="Element")
+merged_df<-distinct(merged_df)
+merged_df<-merged_df[order(merged_df$Element),]
+
+merged_df$TechRep<-1
+merged_df<-mutate(merged_df,BiolRep = ifelse(BiolRep == "aav", 1, BiolRep))
+merged_df<-mutate(merged_df,`ref,alt` = ifelse(str_detect(Element, "scrambled="), "shuf", `ref,alt`))
+merged_df$Experiment<-"PS1.invivo.ISOMPRA.10.8.2024"
+merged_df<-dplyr::rename(merged_df,Allele = `ref,alt`)
+
+merged_df<-merged_df[,c(8,2,1,3,7,6,4:5)]
+write.csv(merged_df,"invivo.ps1.utr.format.10.8.24.csv")
+write_rds(merged_df,"invivo.ps1.utr.format.10.8.24.rds")
+```
+
+## eMPRA long format
+
+```{r utr-format-empra, include=FALSE}
+# NOTE: meta.file3.trev.rds is read from an absolute path; update for your machine.
+meta.file3.trev <- readRDS("C:/Users/dinse/Desktop/ISOMPRA/ps1.isompra.mgi/meta.file3.trev.rds")
+metatab.reformatted<-meta.file3.trev[,c(6,10)]
+
+pivotedsic<-tmp[,c(1:18,20,21)]
+
+pivoted_long <- pivot_longer(pivotedsic, cols = c(2:19), names_to = "Replicate", values_to = "Value")
+pivoted_long <- pivoted_long %>%
+  dplyr::group_by(rsID) %>%
+  dplyr::arrange(rsID, revcomp_barcode) %>%
+  dplyr::mutate(BC = pmin(dense_rank(revcomp_barcode), 20))
+
+pivoted_long <- pivoted_long %>%
+  dplyr::mutate(Replicate = ifelse(Replicate %in% c("ms1","ms2","ms3","ms4","ms5","ms6","ms7","ms8","ms9","ms10","ms12","ms13","ms15","ms16","ms17","ms18","ms22"), match(Replicate, c("ms1","ms2","ms3","ms4","ms5","ms6","ms7","ms8","ms9","ms10","ms12","ms13","ms15","ms16","ms17","ms18","ms22")), Replicate))
+
+pivoted_long <- pivoted_long %>%
+  dplyr::mutate(
+    Replicate = ifelse(Replicate %in% c("ms1","ms2","ms3","ms4","ms5","ms6","ms7","ms8","ms9","ms10","ms12","ms13","ms15","ms16","ms17","ms18","ms22"), match(Replicate, c("ms1","ms2","ms3","ms4","ms5","ms6","ms7","ms8","ms9","ms10","ms12","ms13","ms15","ms16","ms17","ms18","ms22")), Replicate),
+    BiolRep = ifelse(Replicate %in% c("1", "2", "3","4","5","6","7","8","9","10","11","12","13","14","15","16","17"), "rna.total", 
+                      ifelse(Replicate == "aav", "dna.total", NA_character_))
+  )
+
+pivotedsic2<-tmp[,c(1,22:38,40,21)]
+
+pivoted_long2 <- pivot_longer(pivotedsic2, cols = c(2:19), names_to = "Replicate", values_to = "Value")
+pivoted_long2 <- pivoted_long2 %>%
+  dplyr::group_by(rsID) %>%
+  dplyr::arrange(rsID, revcomp_barcode) %>%
+  dplyr::mutate(BC = pmin(dense_rank(revcomp_barcode), 20))
+
+pivoted_long2 <- pivoted_long2 %>%
+  mutate(Replicate = ifelse(Replicate %in% c("ms1_cpm","ms2_cpm","ms3_cpm","ms4_cpm","ms5_cpm","ms6_cpm","ms7_cpm","ms8_cpm","ms9_cpm","ms10_cpm","ms12_cpm","ms13_cpm","ms15_cpm","ms16_cpm","ms17_cpm","ms18_cpm","ms22_cpm"), match(Replicate, c("ms1_cpm","ms2_cpm","ms3_cpm","ms4_cpm","ms5_cpm","ms6_cpm","ms7_cpm","ms8_cpm","ms9_cpm","ms10_cpm","ms12_cpm","ms13_cpm","ms15_cpm","ms16_cpm","ms17_cpm","ms18_cpm","ms22_cpm")), Replicate))
+
+pivoted_long2 <- pivoted_long2 %>%
+  mutate(
+    Replicate = ifelse(Replicate %in% c("ms1_cpm","ms2_cpm","ms3_cpm","ms4_cpm","ms5_cpm","ms6_cpm","ms7_cpm","ms8_cpm","ms9_cpm","ms10_cpm","ms12_cpm","ms13_cpm","ms15_cpm","ms16_cpm","ms17_cpm","ms18_cpm","ms22_cpm"
+), match(Replicate, c("ms1_cpm","ms2_cpm","ms3_cpm","ms4_cpm","ms5_cpm","ms6_cpm","ms7_cpm","ms8_cpm","ms9_cpm","ms10_cpm","ms12_cpm","ms13_cpm","ms15_cpm","ms16_cpm","ms17_cpm","ms18_cpm","ms22_cpm")), Replicate),
+    BiolRep = ifelse(Replicate %in% c("1", "2", "3","4","5","6","7","8","9","10","11","12","13","14","15","16","17"), "rna.total", 
+                      ifelse(Replicate == "aav_cpm", "dna.total", NA_character_))
+  )
+
+pivoted_long2$Replicate[pivoted_long2$Replicate == "aav_cpm"] <- "aav"
+merged_df <- inner_join(pivoted_long,pivoted_long2,by=c("revcomp_barcode","Replicate"))
+merged_df<-merged_df[,c(1:4,8,5:6)]
+names(merged_df)<-c("revcomp_barcode","Element","BiolRep","Counts","CPM","BC","Fraction")
+metatab.reformatted$barcode_allele <- gsub("_", "=", metatab.reformatted$barcode_allele)
+names(metatab.reformatted)<-c("ref,alt","Element")
+merged_df$Element <- gsub("scrambled*", "scrambled=", merged_df$Element)
+merged_df$Element <- gsub("Basal*", "Basal=", merged_df$Element)
+merged_df<-right_join(metatab.reformatted,merged_df,by="Element")
+merged_df<-distinct(merged_df)
+merged_df<-merged_df[order(merged_df$Element),]
+
+merged_df$TechRep<-1
+merged_df<-mutate(merged_df,BiolRep = ifelse(BiolRep == "aav", 1, BiolRep))
+merged_df<-mutate(merged_df,`ref,alt` = ifelse(str_detect(Element, "scrambled="), "shuf", `ref,alt`))
+merged_df<-mutate(merged_df,`ref,alt` = ifelse(str_detect(Element, "Basal="), "ref", `ref,alt`))
+merged_df$Experiment<-"PS1.HEK.eMPRA.9.20.24"
+merged_df<-dplyr::rename(merged_df,Allele = `ref,alt`)
+
+merged_df<-merged_df[,c(10,3,2,1,7,4,9,8,5:6)]
+write.csv(merged_df,"empratrev.utr.format.9.20.24.csv")
+write_rds(merged_df,"empratrev.utr.format.9.20.24.rds")
+
+
+rm(col_log,cor_df,cor_matrix,corr.values.trevino,corr.values.trevino.sanity,data_for_mds.expr,mappedcounts,mds_result.expr,merged_df,pivoted_long,pivoted_long2,pivotedsic,pivotedsic2,totalreads,totalreads.empra,totalreadsout,totalreadsout.trevino,totalreadsout.trevino.isompra)
+```
