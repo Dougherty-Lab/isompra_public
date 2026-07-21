@@ -1,0 +1,468 @@
+---
+title: "ISOMPRA HEK293 Library 1 and 2 Barcodeless 06-30-2022"
+author: "Anthony Fischer"
+date: '2022-06-30'
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##Load Tools and Set Theme
+```{r Load_Tools}
+source("../../code/mpra_tools/mpra_tools.R")
+library(umap)
+# A list of elements we do not consider from Library 1.0 as they have bad variant sequences (not generated correctly)
+badAlt <- c("ZNF626_wgs", "ASIC2_wgs", "CDKN2B_wgs", "ELMO1_wgs", "ENPP5_wgs", "GDPD4_ssc", "INSR_wgs", "LMBRD2_wgs", "LRP2BP_wgs", "SCARB2.1_wgs", "TLK1_wgs", "TRIM37_wgs", "ZCCHC11_wgs")
+# Set the theme for all ggplots
+theme_set(
+  theme_classic2(base_family = "sans") +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 10),
+      legend.title = element_text(size = 14, face = "bold"),
+      legend.text = element_text(size = 10, face = "bold"),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 1)
+    )
+)
+```
+
+##Define Welch's T-test Function for Reference vs. Shuffled
+```{r Welch's Function}
+welch_shuftest <- function(data_table, element, allele, null_values) {
+  d <- filter(data_table, Allele == allele, Element == element)
+  res <- t.test(d$Expression, null_values, var.equal = FALSE)
+  dif <- res$estimate[1] - res$estimate[2]
+  pval <- res$p.value
+  return(c(element, dif, pval))
+}
+```
+
+##Load in Data
+```{r Reading in Formatted Counts,include=FALSE}
+# Reading in counts file
+d <- fread("../../data/formatted/Library1and2BCLess_ISOMPRA_6-30-2022/formatted_Reads_compiled_06-30-2022.tsv")
+d <- filter(d, !Element %in% badAlt)
+```
+
+##Sequencing Depths and Element Coverage for Summary Table
+```{r Sequencing Depth and Metrics}
+countmetrics <- as.data.table(ddply(d, c("BiolRep", "TechRep", "Comment"), summarize,
+  Quantile25 = round(quantile(Counts, na.rm = TRUE)[[2]], 0),
+  Quantile75 = round(quantile(Counts, na.rm = TRUE)[[4]], 0),
+  Median = median(Counts), Total_Reads = sum(Counts),
+  Coverage = round(sum(Counts) / 8690, 0),
+  Elements_Represented = sum((Counts != 0) / 8690)
+))
+
+
+# Combine with other summary stats
+small <- countmetrics %>%
+  group_by(Comment) %>%
+  summarize(across(3:8, list(mean = mean, sd = sd), .names = "{.col}_{.fn}"))
+
+print(small)
+```
+
+##Create log2 (RNA/DNA) Expression Tables
+###Aggregate DNA Counts for RNA Normalization
+```{r Creation_of_SA_Expression Tables, include=FALSE}
+# Here we create the expression tables for use in all downstream linear modeling
+# For the purposes of the markdown, I am not including this, but it must be run
+# at least once to create the tables the linear models will use
+
+# Aggregate DNA counts
+
+d <- aggregate.counts(d, "Fraction", "DNA", "DNA.AGG", c("BiolRep", "TechRep"), c(1, 1), c("Fraction", "BiolRep"))
+```
+
+###Splicing Agnostic Table and Testable Element Pairs
+```{r SA_Expression_Table}
+# Filtering data for good representation (read the filter_elements function for more info)
+to.test <- filter_elements(filter(d, Comment == "Input Splicing Agnostic mRNA" | Comment == "Plasmid DNA"), "Fraction", "RNA", "DNA.AGG", min.bc = 1)
+
+SA_counts <- filter(
+  d, Element %in% to.test$Element,
+  (Fraction == "RNA" | Fraction == "DNA.AGG"),
+  (Comment == "Input Splicing Agnostic mRNA" | Comment == "Plasmid DNA")
+)
+
+# Performing edgeR style normalization on counts
+
+SA_counts <- normalize.counts.edgeR(SA_counts, sample.fields = c("Experiment", "Fraction", "BiolRep", "TechRep", "Comment"))
+
+# Keeping only the columns we need
+SA_counts <- select(SA_counts, c("Element", "Allele", "BC", "Fraction", "BiolRep", "TechRep", "CPM"))
+
+# Computing Expression
+SA_exp <- compute.expression(SA_counts, steps = list(c("normalize", "Fraction", "RNA", "DNA.AGG", "BiolRep"), c("log")))
+
+fwrite(SA_exp, "splicing_agnostic_expression.csv")
+```
+
+###Pre-Splicing Table and Testable Element Pairs
+```{r intron_table}
+intronic.to.test <- filter_elements(filter(d, Comment == "Input Intronic (pre) mRNA" | Comment == "Plasmid DNA"), "Fraction", "RNA", "DNA.AGG", min.bc = 1)
+
+intron_counts <- filter(
+  d, Element %in% intronic.to.test$Element,
+  (Fraction == "RNA" | Fraction == "DNA.AGG"),
+  Comment == "Input Intronic (pre) mRNA" | Comment == "Plasmid DNA"
+)
+
+# EdgeR Normalize
+intron_counts <- normalize.counts.edgeR(intron_counts, sample.fields = c("Experiment", "Fraction", "BiolRep", "TechRep", "Comment"))
+
+# Keeping only the columns we need
+intron_counts <- select(intron_counts, c("Element", "Allele", "BC", "Fraction", "BiolRep", "TechRep", "CPM"))
+
+intron_exp <- compute.expression(intron_counts, steps = list(c("normalize", "Fraction", "RNA", "DNA.AGG", "BiolRep"), c("log")))
+
+fwrite(intron_exp, "presplicing_expression.csv")
+```
+
+###Post-Splicing Table and Testable Element Pairs
+```{r exon_table}
+exonic.to.test <- filter_elements(filter(d, Comment == "Input Exonic (mature) mRNA" | Comment == "Plasmid DNA"), "Fraction", "RNA", "DNA.AGG", min.bc = 1)
+
+exon_counts <- filter(
+  d, Element %in% exonic.to.test$Element,
+  (Fraction == "RNA" | Fraction == "DNA.AGG"),
+  Comment == "Input Exonic (mature) mRNA" | Comment == "Plasmid DNA"
+)
+
+# EdgeR Normalize
+exon_counts <- normalize.counts.edgeR(exon_counts, sample.fields = c("Experiment", "Fraction", "BiolRep", "TechRep", "Comment"))
+
+# Keeping only the columns we need
+exon_counts <- select(exon_counts, c("Element", "Allele", "BC", "Fraction", "BiolRep", "TechRep", "CPM"))
+
+
+exon_exp <- compute.expression(exon_counts, steps = list(c("normalize", "Fraction", "RNA", "DNA.AGG", "BiolRep"), c("log")))
+
+fwrite(exon_exp, "postsplicing_expression.csv")
+```
+
+###Combine Pre- and Post-Splicing Tables for Stability Modeling
+```{r pre_and_post_combine}
+exp_all <- rbind(intron_exp[, SpliceStatus := "pre-mRNA"], exon_exp[, SpliceStatus := "Mature mRNA"])
+
+fwrite(exp_all, "preandpostsplicing_expression.csv")
+```
+
+###TRAP Table and Testable Element Pairs
+```{r TRAP_table}
+# Instead of using log2 RNA/DNA counts to normalize TRAP to input, we are just
+# going to use the CPM of TRAP normalized by the CPM of input, this keeps less
+# calculations which is better for modeling, since both values came from the same
+# DNA
+
+TRAP.SA.to.test <- filter_elements(filter(d, Comment == "TRAP Splicing Agnostic mRNA" | Comment == "Plasmid DNA"), "Fraction", "RNA", "DNA.AGG", min.bc = 1)
+TRAP.exonic.to.test <- filter_elements(filter(d, Comment == "TRAP Exonic (mature) mRNA" | Comment == "Plasmid DNA"), "Fraction", "RNA", "DNA.AGG", min.bc = 1)
+
+TRAP_SA_counts <- filter(
+  d, Element %in% TRAP.SA.to.test$Element,
+  (Fraction == "RNA" | Fraction == "DNA.AGG"),
+  Comment == "TRAP Splicing Agnostic mRNA" | Comment == "Plasmid DNA"
+)
+
+TRAP_exon_counts <- filter(
+  d, Element %in% TRAP.exonic.to.test$Element,
+  (Fraction == "RNA" | Fraction == "DNA.AGG"),
+  Comment == "TRAP Exonic (mature) mRNA" | Comment == "Plasmid DNA"
+)
+
+
+# EdgeR Normalize
+TRAP_SA_counts <- normalize.counts.edgeR(TRAP_SA_counts, sample.fields = c("Experiment", "Fraction", "BiolRep", "TechRep", "Comment"))
+
+TRAP_exon_counts <- normalize.counts.edgeR(TRAP_exon_counts, sample.fields = c("Experiment", "Fraction", "BiolRep", "TechRep", "Comment"))
+
+# Keeping only the columns we need
+TRAP_SA_counts <- select(TRAP_SA_counts, c("Element", "Allele", "BC", "Fraction", "BiolRep", "TechRep", "CPM"))
+TRAP_exon_counts <- select(TRAP_exon_counts, c("Element", "Allele", "BC", "Fraction", "BiolRep", "TechRep", "CPM"))
+
+# Here is where we calculate the translation.  We take the edgeR normalized CPMs
+# of the TRAP experiment and divide by the corresponding input.  We will keep
+# splicing agnostic and exonic separate
+
+TRAP_SA_counts_joined <- inner_join(filter(TRAP_SA_counts, Fraction == "RNA"),
+  filter(SA_counts, Fraction == "RNA"),
+  by = c("Element", "Allele", "BiolRep")
+) %>%
+  mutate(Translation = log2(CPM.x / CPM.y))
+TRAP_exon_counts_joined <- inner_join(filter(TRAP_exon_counts, Fraction == "RNA"),
+  filter(exon_counts, Fraction == "RNA"),
+  by = c("Element", "Allele", "BiolRep")
+) %>%
+  mutate(Translation = log2(CPM.x / CPM.y))
+
+fwrite(TRAP_SA_counts_joined, "TRAP Splicing Agnostic Translation.csv")
+fwrite(TRAP_exon_counts_joined, "TRAP Post-Splicing Translation.csv")
+```
+
+##Analyze CPM Correlation
+```{r}
+cpm_corrs <- d %>%
+  mutate(Rep_ID = paste0("B", BiolRep, "_T", TechRep)) %>%
+  select(Element, Allele, Comment, Rep_ID, CPM) %>%
+  pivot_wider(names_from = Rep_ID, values_from = CPM) %>%
+  group_by(Comment) %>%
+  summarise(
+    Stats = list({
+      # 1. Drop the identifier columns
+      mat <- select(across(everything()), -Element, -Allele)
+      
+      # 2. CRITICAL: Drop columns that are completely empty (all NA) for THIS group
+      mat <- mat[, colSums(!is.na(mat)) > 0, drop = FALSE]
+      
+      # 3. Only calculate correlation if we have at least 2 replicates to compare
+      if (ncol(mat) >= 2) {
+        # use = "pairwise.complete.obs" is much safer here
+        cor_matrix <- cor(mat, use = "pairwise.complete.obs")
+        unique_corrs <- cor_matrix[upper.tri(cor_matrix)]
+        
+        tibble(
+          CPM_cor_mean = mean(unique_corrs, na.rm = TRUE),
+          CPM_cor_sd   = sd(unique_corrs, na.rm = TRUE)
+        )
+      } else {
+        # Return NA if a group only has 1 replicate total
+        tibble(CPM_cor_mean = NA_real_, CPM_cor_sd = NA_real_)
+      }
+    })
+  ) %>%
+  ungroup() %>%
+  unnest(Stats)
+```
+
+
+##Analyze Expression Correlation 
+```{r}
+# 1. Load your datasets and shape them wide
+intron_exp <- fread("presplicing_expression.csv") %>% pivot_wider(names_from = "BiolRep", values_from = "Expression")
+exon_exp  <- fread("postsplicing_expression.csv") %>% pivot_wider(names_from = "BiolRep", values_from = "Expression")
+TRAP_exp  <- fread("TRAP Splicing Agnostic Translation.csv")[is.finite(Translation)] %>% 
+  pivot_wider(names_from = "BiolRep", id_cols = c("Element", "Allele"), values_from = "Translation")
+SA_exp <- fread("splicing_agnostic_expression.csv") %>% pivot_wider(names_from = "BiolRep", values_from = "Expression")
+TRAP_exon_exp <- fread("TRAP Post-Splicing Translation.csv")[is.finite(Translation)] %>% 
+  pivot_wider(names_from = "BiolRep", id_cols = c("Element", "Allele"), values_from = "Translation")
+
+# 2. Put them in a named list
+exp_list <- list(
+  "Intron" = intron_exp,
+  "Exon"   = exon_exp,
+  "TRAP"   = TRAP_exp,
+  "TRAP_exon" = TRAP_exon_exp,
+  "Agnostic" = SA_exp
+)
+
+# 3. Define a single helper function to calculate the un-skewed stats
+calculate_group_cor <- function(df) {
+  # Drop non-numeric identifier columns dynamically instead of hardcoding numbers
+  mat <- df %>% select(where(is.numeric))
+  
+  # Compute pairwise correlation matrix
+  cor_matrix <- cor(mat, use = "pairwise.complete.obs")
+  
+  # Keep ONLY the upper triangle (no self-correlations, no double-counting)
+  unique_corrs <- cor_matrix[upper.tri(cor_matrix)]
+  
+  # Return the summarized stats
+  tibble(
+    Mean_Correlation = mean(unique_corrs, na.rm = TRUE),
+    SD_Correlation   = sd(unique_corrs, na.rm = TRUE)
+  )
+}
+
+# 4. Map over the list to generate one unified table
+summary_table <- map_dfr(exp_list, calculate_group_cor, .id = "Library_Type")
+
+# Print the final result
+print(summary_table)
+```
+
+##Linear Modeling and Welch's T-Tests
+```{r Linear Modeling, include=FALSE}
+# For the purposes of the markdown, I am not including these, but they must be run
+# at least once to create the model results tables, which are then written to tsv's
+# The remainder of the markdown will contain code to display volcano plots, etc.,
+# but rerunning linear models repeatedly when a small change is made elsewhere is
+# inefficient (obviously)
+
+# For the shuffled stuff, redone on 9-3-24, we set the "ref" level to shuffled
+# and the "alt" level to reference, to indicate when we compare shuffled to
+# reference the emergence or loss of regulatory sequences in the reference
+
+# Call back all expression tables
+SA_exp <- fread("splicing_agnostic_expression.csv")
+intron_exp <- fread("presplicing_expression.csv")
+exon_exp <- fread("postsplicing_expression.csv")
+exp_all <- fread("preandpostsplicing_expression.csv")
+TRAP_SA_exp <- fread("TRAP Splicing Agnostic Translation.csv")
+TRAP_exon_exp <- fread("TRAP Post-Splicing Translation.csv")
+```
+
+###Splicing Agnostic Ref vs Alt Linear Modeling
+```{r SA_refalt_modeling}
+
+results.lm <- mpratools.lm(SA_exp)
+
+fwrite(results.lm, "Splicing-Agnostic_RefvsAlt_LM.tsv", sep = "\t")
+
+results.lm <- fread("./Splicing-Agnostic_RefvsAlt_LM.tsv")
+results.lm.annotated <- full_join(results.lm, fread("../../code/mpra_tools/fullannotationtable.txt"))
+fwrite(results.lm.annotated, "Splicing-Agnostic_RefvsAlt_LM_Annotated.tsv", sep = "\t")
+```
+
+###Splicing Agnostic Ref vs Shuf Welch's
+```{r SA_refshuf_test}
+elems <- unique(SA_exp$Element)
+nulls <- as.data.table(filter(SA_exp, Allele == "shuf") %>% group_by(Element) %>%
+  summarize(Expression = mean(Expression)))
+res_shuf <- lapply(elems, function(element) {
+  welch_shuftest(data_table = SA_exp, element = element, allele = "ref", null_values = nulls$Expression)
+})
+res_shuf <- as.data.table(do.call(rbind, res_shuf))
+setnames(res_shuf, , c("Element", "logFC", "p.val"))
+res_shuf$fdr <- p.adjust(res_shuf$p.val, method = "fdr")
+res_shuf <- full_join(res_shuf, fread("../../code/mpra_tools/fullannotationtable.txt"))[, !c("Pos", "Ref", "Alt", "Type", "Pheno", "library_seq_alt", "library_seq_shuf")]
+fwrite(res_shuf, "Splicing-Agnostic_RefvsShuf_Welchs.tsv")
+```
+
+###Pre-Splicing Ref vs Alt Linear Modeling
+```{r intron_refalt_modeling}
+results.lm.intronic <- mpratools.lm(intron_exp)
+fwrite(results.lm.intronic, "Pre-Splicing_RefvsAlt_LM.tsv", sep = "\t")
+results.lm.intronic.annotated <- full_join(results.lm.intronic, fread("../../code/mpra_tools/fullannotationtable.txt"))
+fwrite(results.lm.intronic.annotated, "Pre-Splicing_RefvsAlt_LM_Annotated.tsv", sep = "\t")
+```
+
+###Pre-Splicing Ref vs Shuf Welch's
+```{r intron_refshuf_test}
+elems <- unique(intron_exp$Element)
+nulls <- as.data.table(filter(intron_exp, Allele == "shuf") %>% group_by(Element) %>%
+  summarize(Expression = mean(Expression)))
+intron_shuf <- lapply(elems, function(element) {
+  welch_shuftest(data_table = intron_exp, element = element, allele = "ref", null_values = nulls$Expression)
+})
+intron_shuf <- as.data.table(do.call(rbind, intron_shuf))
+setnames(intron_shuf, , c("Element", "logFC", "p.val"))
+intron_shuf$fdr <- p.adjust(intron_shuf$p.val, method = "fdr")
+intron_shuf <- full_join(intron_shuf, fread("../../code/mpra_tools/fullannotationtable.txt"))[, !c("Pos", "Ref", "Alt", "Type", "Pheno", "library_seq_alt", "library_seq_shuf")]
+fwrite(intron_shuf, "Pre-Splicing_RefvsShuf_Welchs.tsv")
+```
+
+###Post-Splicing Ref vs Alt Linear Modeling
+```{r exon_refalt_modeling}
+results.lm.exonic <- mpratools.lm(exon_exp)
+fwrite(results.lm.exonic, "Post-Splicing_RefvsAlt_LM.tsv", sep = "\t")
+results.lm.exonic.annotated <- full_join(results.lm.exonic, fread("../../code/mpra_tools/fullannotationtable.txt"))
+fwrite(results.lm.exonic.annotated, "Post-Splicing_RefvsAlt_LM_Annotated.tsv", sep = "\t")
+```
+
+###Post-Splicing Ref vs Shuf Welch's
+```{r exon_refshuf_test}
+elems <- unique(exon_exp$Element)
+nulls <- as.data.table(filter(exon_exp, Allele == "shuf") %>% group_by(Element) %>%
+  summarize(Expression = mean(Expression)))
+exon_shuf <- lapply(elems, function(element) {
+  welch_shuftest(data_table = exon_exp, element = element, allele = "ref", null_values = nulls$Expression)
+})
+exon_shuf <- as.data.table(do.call(rbind, exon_shuf))
+setnames(exon_shuf, , c("Element", "logFC", "p.val"))
+exon_shuf$fdr <- p.adjust(exon_shuf$p.val, method = "fdr")
+exon_shuf <- full_join(exon_shuf, fread("../../code/mpra_tools/fullannotationtable.txt"))[, !c("Pos", "Ref", "Alt", "Type", "Pheno", "library_seq_alt", "library_seq_shuf")]
+fwrite(exon_shuf, "Post-Splicing_RefvsShuf_Welchs.tsv")
+```
+
+###Stability Ref vs. Alt Linear Interaction Modeling
+```{r Stability_refalt_modeling}
+results.lm.int <- mpratools.lm.int(filter(exp_all, Element %in% intersect(intronic.to.test$Element, exonic.to.test$Element)))
+
+fwrite(results.lm.int, "Stability_RefvsAlt_LM.tsv", sep = "\t")
+results.lm.int <- fread("./Stability_RefvsAlt_LM.tsv")
+results.lm.int.annotated <- full_join(results.lm.int, fread("../../code/mpra_tools/fullannotationtable.txt"))
+
+fwrite(results.lm.int.annotated, "Stability_RefvsAlt_LM_Annotated.tsv", sep = "\t")
+```
+
+###Stability Ref vs Shuf Welch's
+```{r stability_refshuf_test}
+# We cannot do an interaction model for non-parametric (well, we can, but it's
+# complicated), so we are going to subtract pre from post expression to get "stability"
+stab_exp <- inner_join(intron_exp, exon_exp, by = c("Element", "Allele", "BiolRep", "TechRep"))
+stab_exp[, Expression := Expression.y - Expression.x]
+
+elems <- unique(stab_exp$Element)
+nulls <- as.data.table(filter(stab_exp, Allele == "shuf") %>% group_by(Element) %>%
+  summarize(Expression = mean(Expression)))
+stab_shuf <- lapply(elems, function(element) {
+  welch_shuftest(data_table = stab_exp, element = element, allele = "ref", null_values = nulls$Expression)
+})
+stab_shuf <- as.data.table(do.call(rbind, stab_shuf))
+setnames(stab_shuf, , c("Element", "logFC", "p.val"))
+stab_shuf$fdr <- p.adjust(stab_shuf$p.val, method = "fdr")
+stab_shuf <- full_join(stab_shuf, fread("../../code/mpra_tools/fullannotationtable.txt"))[, !c("Pos", "Ref", "Alt", "Type", "Pheno", "library_seq_alt", "library_seq_shuf")]
+fwrite(stab_shuf, "Stability_RefvsShuf_Welchs.tsv")
+```
+
+###Translational Efficiency (TE) Ref vs Alt Linear Modeling
+```{r TE_refalt_modeling}
+
+# For the Splicing Agnostic, if you look at a UMAP/MDS plot, BiolRep 8 from the input
+# and BiolRep 1 from the TRAP had bad correlation with the other libraries, so
+# we eliminate them from the linear modeling
+# The Post-Splicing libraries did not have this problem
+results.lm.TRAPSA <- mpratools.lm(
+  filter(TRAP_SA_exp, BiolRep != 1, BiolRep != 8),
+  Translation ~ Allele
+)
+results.lm.TRAPexonic <- mpratools.lm(TRAP_exon_exp, Translation ~ Allele)
+
+fwrite(results.lm.TRAPSA, "Translation_Splicing-Agnostic_RefvsAlt_LM.tsv", sep = "\t")
+fwrite(results.lm.TRAPexonic, "Translation_Post-Splicing_RefvsAlt_LM.tsv", sep = "\t")
+
+results.lm.TRAPSA <- fread("./Translation_Splicing-Agnostic_RefvsAlt_LM.tsv")
+results.lm.TRAPexonic <- fread("./Translation_Post-Splicing_RefvsAlt_LM.tsv")
+results.lm.TRAPSA.annotated <- full_join(results.lm.TRAPSA, fread("../../code/mpra_tools/fullannotationtable.txt"))
+results.lm.TRAPexonic.annotated <- full_join(results.lm.TRAPexonic, fread("../../code/mpra_tools/fullannotationtable.txt"))
+
+fwrite(results.lm.TRAPSA.annotated, "Translation_Splicing-Agnostic_RefvsAlt_LM_Annotated.tsv", sep = "\t")
+fwrite(results.lm.TRAPexonic.annotated, "Translation_Post-Splicing_RefvsAlt_LM_Annotated.tsv", sep = "\t")
+```
+
+###Translational Efficiency (TE) Ref vs Shuf Linear Modeling
+```{r TE_refshuf_test}
+elems <- unique(TRAP_SA_exp$Element)
+# Have to relabel the translation column
+setnames(TRAP_SA_exp, "Translation", "Expression")
+nulls <- as.data.table(filter(TRAP_SA_exp, Allele == "shuf") %>% group_by(Element) %>%
+  summarize(Expression = mean(Expression))) %>% filter(is.finite(Expression))
+TRAPSA_shuf <- lapply(elems, function(element) {
+  welch_shuftest(data_table = filter(TRAP_SA_exp, is.finite(Expression)), element = element, allele = "ref", null_values = nulls$Expression)
+})
+TRAPSA_shuf <- as.data.table(do.call(rbind, TRAPSA_shuf))
+setnames(TRAPSA_shuf, , c("Element", "logFC", "p.val"))
+TRAPSA_shuf$fdr <- p.adjust(TRAPSA_shuf$p.val, method = "fdr")
+TRAPSA_shuf <- full_join(TRAPSA_shuf, fread("../../code/mpra_tools/fullannotationtable.txt"))[, !c("Pos", "Ref", "Alt", "Type", "Pheno", "library_seq_alt", "library_seq_shuf")]
+fwrite(TRAPSA_shuf, "Translation_Splicing-Agnostic_RefvsShuf_Welchs.tsv")
+
+elems <- unique(TRAP_exon_exp$Element)
+# Have to relabel the translation column
+setnames(TRAP_exon_exp, "Translation", "Expression")
+nulls <- as.data.table(filter(TRAP_exon_exp, Allele == "shuf") %>% group_by(Element) %>%
+  summarize(Expression = mean(Expression))) %>% filter(is.finite(Expression))
+TRAPexon_shuf <- lapply(elems, function(element) {
+  welch_shuftest(data_table = filter(TRAP_exon_exp, is.finite(Expression)), element = element, allele = "ref", null_values = nulls$Expression)
+})
+TRAPexon_shuf <- as.data.table(do.call(rbind, TRAPexon_shuf))
+setnames(TRAPexon_shuf, , c("Element", "logFC", "p.val"))
+TRAPexon_shuf$fdr <- p.adjust(TRAPexon_shuf$p.val, method = "fdr")
+TRAPexon_shuf <- full_join(TRAPexon_shuf, fread("../../code/mpra_tools/fullannotationtable.txt"))[, !c("Pos", "Ref", "Alt", "Type", "Pheno", "library_seq_alt", "library_seq_shuf")]
+fwrite(TRAPexon_shuf, "Translation_Post-Splicing_RefvsShuf_Welchs.tsv")
+```

@@ -1,0 +1,2140 @@
+---
+title: "ISOMPRA Paper Figure Making"
+author: "Anthony Fischer"
+date: "2024-07-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##Load Tools
+```{r}
+library(here)
+source(here("uISOMPRA/code/mpra_tools","mpra_tools.R"))
+library(umap)
+library(RColorBrewer)
+library(ggforce)
+library(fplot)
+library(pdftools)
+library(gkmSVM)
+library(ggbreak)
+library(xtable)
+library(knitr)
+library(readxl)
+library(openxlsx)
+library(ggrain)
+library(tidyverse)
+library(limma)
+library(dplyr)
+cbPalette <- brewer.pal(8,"Dark2")
+#A list of elements we do not consider from Library 1.0 as they have bad alts or something
+badAlt<-c('ZNF626_wgs','ASIC2_wgs', 'CDKN2B_wgs', 'ELMO1_wgs', 'ENPP5_wgs', 'GDPD4_ssc', 'INSR_wgs', 'LMBRD2_wgs', 'LRP2BP_wgs', 'SCARB2.1_wgs', 'TLK1_wgs', 'TRIM37_wgs', 'ZCCHC11_wgs')
+#Set the theme for all ggplots
+theme_set(
+  theme_classic2(base_family = "sans")+
+theme(plot.title=element_text(hjust=0.5, size = 14, face = "bold"),
+      plot.subtitle = element_text(hjust=0.5, size = 12, face = "bold"),
+  axis.title = element_text(size = 12),
+  axis.text = element_text(size = 10),
+  legend.title = element_text(size = 14, face = "bold",hjust=0.5),
+  legend.text = element_text(size = 10, face = "bold"),
+  panel.border = element_rect(color = "black", fill = NA, linewidth = 1)))
+
+dir.create("./Figures")
+dir.create("./Tables")
+```
+
+##Figure 2
+```{r load_data}
+#Make the directory
+dir.create("./Figures/Figure_2")
+d <- fread("../data/formatted/Library1and2BCLess_ISOMPRA_6-30-2022/formatted_Reads_compiled_06-30-2022.tsv") %>% filter(,!Element %in% badAlt)
+```
+
+###Figure 2J
+```{r figure_2J}
+library(tidyverse)
+
+# 1. Harmonize the replicate columns and filter out unwanted comments
+d_prepared <- d %>%
+  filter(!Comment %in% c("Input Splicing Agnostic mRNA", "TRAP Exonic (mature) mRNA")) %>%
+  mutate(BiolRep = na_if(BiolRep, 0)) %>% 
+  mutate(UnifiedRep = coalesce(BiolRep, TechRep)) %>%
+  select(Element, Allele, Comment, UnifiedRep, CPM)
+
+# 2. Join data against itself, keeping ALL non-self comparisons
+d_pairs <- d_prepared %>%
+  inner_join(., ., by = c("Element", "Allele", "Comment"), suffix = c("1", "2")) %>%
+  # Keeps both Rep1_vs_Rep2 AND Rep2_vs_Rep1, but drops self-comparisons
+  filter(UnifiedRep1 != UnifiedRep2)
+
+# 3. Calculate the average correlation for EACH replicate within each Comment
+d_cpm_rep_means <- d_pairs %>%
+  group_by(Comment, UnifiedRep1, UnifiedRep2) %>%
+  summarize(Cor = cor(CPM1, CPM2, method = "spearman"), .groups = "drop") %>%
+  
+  # Group by UnifiedRep1 to average its correlation against all its peers
+  group_by(Comment, UnifiedRep1) %>%
+  summarize(MeanCor = mean(Cor), .groups = "drop") %>%
+  
+  # 4. Apply clean factor labels for plotting
+  mutate(Comment = factor(Comment,
+    levels = c("Input Intronic (pre) mRNA", "Input Exonic (mature) mRNA", "TRAP Splicing Agnostic mRNA", "Plasmid DNA"),
+    labels = c("Pre-Splicing", "Post-Splicing", "TRAP", "Plasmid DNA")
+  ))
+
+# 5. Generate the Boxplot (Using MeanCor now)
+p7 <- ggplot(d_cpm_rep_means, aes(x = Comment, y = MeanCor, fill = Comment)) +
+  geom_boxplot(outliers = FALSE) +
+  geom_point(shape = 21, size = 2, position = position_jitter(width = 0.2)) +
+  scale_fill_manual(values = c("#7ADCBF", "#21C494", "#178968", "#0A3B2C")) +
+  labs(y = "Mean Spearman Correlation per Replicate", title = "CPM Correlation (Replicate Averages)") +
+  theme(legend.position = "none", axis.title.x = element_blank()) +
+  coord_fixed(ratio = 30)
+
+# 6. Export
+export_graph_start("./Figures/Figure_2/cpmcorrelationboxplot_fig2J.pdf")
+print(p7)
+export_graph_end()
+```
+
+###Figure 2K
+```{r figure_2K}
+library(tidyverse)
+
+# 1. Calculate the average DNA values (Safe against random NAs)
+d_dna_avg <- d %>%
+  filter(Comment == "Plasmid DNA") %>%
+  group_by(Element, Allele) %>%
+  summarize(DNA_Mean_CPM = mean(CPM, na.rm = TRUE), .groups = "drop")
+
+# 2. Filter for RNA samples, bring in the DNA baseline, and calculate Expression
+d_expression <- d %>%
+  filter(Comment %in% c("Input Intronic (pre) mRNA", 
+                        "Input Exonic (mature) mRNA", 
+                        "TRAP Splicing Agnostic mRNA")) %>%
+  left_join(d_dna_avg, by = c("Element", "Allele")) %>%
+  
+  # Added a small pseudocount (0.01) to protect against log2 of 0 or division by 0
+  mutate(Expression = log2((CPM + 0.01) / (DNA_Mean_CPM + 0.01)))
+
+# 3. Harmonize the replicate columns (Done BEFORE factor re-labeling to prevent empty filters)
+d_prepared <- d_expression %>%
+  mutate(BiolRep = na_if(BiolRep, 0)) %>% 
+  mutate(UnifiedRep = coalesce(BiolRep, TechRep)) %>%
+  select(Element, Allele, Comment, UnifiedRep, Expression)
+
+# 4. Join data against itself, keeping ALL non-self comparisons
+d_pairs <- d_prepared %>%
+  inner_join(., ., by = c("Element", "Allele", "Comment"), suffix = c("1", "2")) %>%
+  filter(UnifiedRep1 != UnifiedRep2)
+
+# 5. Calculate the average correlation safely
+d_exp_rep_means <- d_pairs %>%
+  group_by(Comment, UnifiedRep1, UnifiedRep2) %>%
+  # use = "complete.obs" ensures it skips rows where Expression is NA
+  summarize(Cor = cor(Expression1, Expression2, method = "spearman", use = "complete.obs"), .groups = "drop") %>%
+  
+  # Group by UnifiedRep1 to average its correlation against all its peers
+  group_by(Comment, UnifiedRep1) %>%
+  summarize(MeanCor = mean(Cor, na.rm = TRUE), .groups = "drop") %>%
+  
+  # 6. Apply clean factor labels at the VERY END for safe plotting
+  mutate(Comment = factor(Comment,
+    levels = c("Input Intronic (pre) mRNA", "Input Exonic (mature) mRNA", "TRAP Splicing Agnostic mRNA"),
+    labels = c("Pre-Splicing", "Post-Splicing", "TRAP")
+  ))
+
+# 5. Generate the Boxplot (Using MeanCor now)
+p_exp <- ggplot(d_exp_rep_means, aes(x = Comment, y = MeanCor, fill = Comment)) +
+  geom_boxplot(outliers = FALSE) +
+  geom_point(shape = 21, size = 2, position = position_jitter(width = 0.2)) +
+  scale_fill_manual(values = c("#7ADCBF", "#21C494", "#178968", "#0A3B2C")) +
+  labs(y = "Mean Spearman Correlation per Replicate", title = "Expression Correlation (Replicate Averages)") +
+  theme(legend.position = "none", axis.title.x = element_blank()) +
+#  coord_fixed(ratio = 30)+
+  ylim(min(d_exp_rep_means$MeanCor-0.1),1)
+
+# 6. Export
+export_graph_start("./Figures/Figure_2/expcorrelationboxplot_fig2K.pdf")
+print(p_exp)
+export_graph_end()
+
+```
+
+###Figure 2L
+```{r Figure_2L}
+
+umap_CPM <- d %>%
+  # 1. Keep only the target fractions
+  filter(Comment %in% c("Input Intronic (pre) mRNA",
+                        "Input Exonic (mature) mRNA",
+                        "Input Splicing Agnostic mRNA",
+                        "Plasmid DNA",
+                        "TRAP Exonic (mature) mRNA")) %>%
+  
+  # 2. Convert counts below threshold to NA *before* transforming CPM
+  # This stops low-depth noise from influencing the log scale without losing the row structure
+  mutate(CPM = if_else(Counts > 49, log2(CPM + 1), NA_real_)) %>% 
+  
+  # 3. Pivot to wide format cleanly
+  pivot_wider(
+    id_cols = c(Element, Allele),
+    values_from = "CPM",
+    names_from = c(Comment, BiolRep, TechRep)
+  ) %>% 
+  
+  # 4. Drop elements that failed the threshold in any single sample fraction
+  drop_na()
+
+
+# 5. Separate data into the paired Input matrix and the standalone matrices
+input_metadata <- data.frame(ColName = colnames(umap_CPM[, -c(1, 2)])) %>%
+  mutate(
+    Fraction = sub("_[0-9]+_[0-9]+$", "", ColName),
+    BiolRep  = sub("^.*_([0-9]+)_[0-9]+$", "\\1", ColName)
+  )
+
+# Indices for splitting
+is_input   <- input_metadata$Fraction %in% c("Input Intronic (pre) mRNA", "Input Exonic (mature) mRNA", "Input Splicing Agnostic mRNA")
+is_standalone <- !is_input
+
+# 6. Extract the raw numeric blocks
+matrix_all       <- as.matrix(umap_CPM[, -c(1, 2)])
+matrix_inputs     <- matrix_all[, is_input]
+matrix_standalone <- matrix_all[, is_standalone]
+
+# 7. Correct the Inputs using their true internal pairing structure
+meta_inputs <- input_metadata[is_input, ]
+
+# Design protects the differences between Pre, Mature, and Agnostic
+design_inputs <- model.matrix(~ 0 + Fraction, data = meta_inputs)
+# Batch acts as the pairing factor tracking the 8 RNA pools
+batch_inputs  <- meta_inputs$BiolRep
+
+corrected_inputs <- removeBatchEffect(
+  matrix_inputs,
+  batch = batch_inputs,
+  design = design_inputs
+)
+
+# 8. Recombine the corrected Inputs with the untouched Plasmid & TRAP baselines
+# This preserves the exact baseline variances of controls and target fractions
+corrected_combined <- cbind(corrected_inputs, matrix_standalone)
+
+# 9. Restore the original column ordering so your downstream scripts don't flip out
+corrected <- corrected_combined[, colnames(matrix_all)]
+
+mds_res_corrected <- limma::plotMDS(corrected)
+
+mds_df_corrected <- data.frame(
+  SampleID = colnames(umap_CPM[,-c(1,2)]),
+  Dim1 = mds_res_corrected$x,
+  Dim2 = mds_res_corrected$y
+)
+
+mds_df_corrected <- tidyr::separate(mds_df_corrected,SampleID,c("Library","BiolRep","TechRep"),sep="_")
+
+# Calculate the total variance
+total_var <- sum(mds_res_corrected$eigen.values)
+
+# Calculate percentage for Dim 1 and Dim 2
+var_pc1 <- (mds_res_corrected$eigen.values[1] / total_var) * 100
+var_pc2 <- (mds_res_corrected$eigen.values[2] / total_var) * 100
+
+#Change the Plasmid DNA title
+mds_df_corrected$Library[mds_df_corrected$Library=="Plasmid DNA"] <- "Plasmid DNA (Technical Replicates)"
+
+export_graph_start("./Figures/Figure_2/New MDS Plot CPM_Fig2L.pdf")
+ggplot(mds_df_corrected,aes(x=Dim1,y=Dim2,fill=Library))+geom_point(shape=21,size=3)+
+  geom_polygon(stat = "ellipse",alpha=0.2,color="black")+
+  labs(x=paste0("Leading logFC dim 1 (",round(var_pc1,0),"%)"),
+       y=paste0("Leading logFC dim 2 (",round(var_pc2,0),"%)"))
+export_graph_end()
+
+#Cleanup the environment
+rm(list = setdiff(ls(), lsf.str()))
+```
+
+###Figure 2N
+```{r}
+# See "../analysis/Library1_plus_Controls_forPaper_FullRun_31Jul2025/analysis.Rmd"
+# for Figure 2N generation
+```
+
+##Figure 4
+```{r figure_4}
+cbPalette <- brewer.pal(8,"Dark2")
+dir.create("../figure_making/Figures/Figure_4")
+```
+
+###Figure 4A-D
+```{r figure_4A-D}
+intron_shuf <- fread("../analysis/ActD Trials/Full_Library_08Apr2026/Pre-Splicing_RefvsShuf_Welchs.tsv") %>% .[,plotcolor := as.factor(case_when(
+    (abs(logFC)>log2(1.25) & fdr<0.1) ~ 1,
+    TRUE ~ 2))]
+
+exon_shuf <- fread("../analysis/ActD Trials/Full_Library_08Apr2026/Post-Splicing_RefvsShuf_Welchs.tsv") %>% .[,plotcolor := as.factor(case_when(
+    (abs(logFC)>log2(1.25) & fdr<0.1) ~ 1,
+    TRUE ~ 2))]
+
+stability_shuf <- fread("../analysis/ActD Trials/Full_Library_08Apr2026/Stability_RefvsShuf_Welchs.tsv") %>%
+  .[,plotcolor := as.factor(case_when(
+    (abs(logFC)>log2(1.25) & fdr<0.1) ~ 1,
+    TRUE ~ 2))]
+
+translational_shuf <- fread("../analysis/Library1and2BCLess_ISOMPRA_6-30-2022/Translation_Splicing-Agnostic_RefvsShuf_Welchs.tsv") %>% .[,plotcolor := as.factor(case_when(
+    (abs(logFC)>log2(1.25) & fdr<0.1) ~ 1,
+    TRUE ~ 2))]
+
+p1_shuf <- ggplot(intron_shuf)+
+  geom_point(aes(x=logFC,y=-log10(fdr),fill=plotcolor,alpha = plotcolor),shape=21,size=2)+
+  scale_fill_manual(values=c(cbPalette[1],"lightgray"),
+                    labels=c("Increased Expression","Decreased Expression",
+                             "Not Significant"))+
+  scale_alpha_manual(values = c(1,1,0.1,0.1))+
+  labs(fill="Expression Change",
+       title="Reference vs. Shuffled Expression Change\nin Pre-Splicing Pool",
+       x="Log2 Fold Change in Expression",
+       y="-log10(FDR)")+
+  geom_vline(xintercept = -log2(1.25),linetype="dashed")+
+  geom_vline(xintercept = log2(1.25),linetype="dashed")+
+  geom_hline(yintercept = -log10(0.05),linetype="dashed")+
+  theme(legend.position = "none",aspect.ratio=1)
+
+p2_shuf <- ggplot(exon_shuf)+
+  geom_point(aes(x=logFC,y=-log10(fdr),fill=plotcolor),shape=21,size=2)+
+  scale_fill_manual(values=c(cbPalette[1],"lightgray"),
+                    labels=c("Increased Expression","Decreased Expression",
+                             "Not Significant"))+
+  labs(fill="Expression Change",
+       title="Reference vs. Shuffled Expression Change\nin Post-Splicing Pool",
+       x="Log2 Fold Change in Expression",
+       y="-log10(FDR)")+
+  geom_vline(xintercept = -log2(1.25),linetype="dashed")+
+  geom_vline(xintercept = log2(1.25),linetype="dashed")+
+  geom_hline(yintercept = -log10(0.05),linetype="dashed")+
+  theme(legend.position = "none",aspect.ratio=1)
+
+p3_shuf <- ggplot(stability_shuf)+
+  geom_point(aes(x=logFC,y=-log10(fdr),fill=plotcolor),shape=21,size=2)+
+  scale_fill_manual(values=c(cbPalette[1],"lightgrey"),
+                    labels=c("Increased Stability","Decreased Stability",
+                             "Not Significant"))+
+  labs(fill="Stability Change",
+       title="Reference vs. Shuffled Stability Change",
+       x="Log2 Fold Change in Stability",
+       y="-log10(FDR)")+
+  geom_vline(xintercept = -log2(1.25),linetype="dashed")+
+  geom_vline(xintercept = log2(1.25),linetype="dashed")+
+  geom_hline(yintercept = -log10(0.05),linetype="dashed")+
+  theme(legend.position = "none",aspect.ratio=1)
+
+p4_shuf <- ggplot(translational_shuf)+
+  geom_point(aes(x=logFC,y=-log10(fdr),fill=plotcolor),shape=21,size=2)+
+  scale_fill_manual(values=c(cbPalette[1],"lightgrey"),
+                    labels=c("Increased Translation","Decreased Translation",
+                             "Not Significant"))+
+  labs(fill="Translational Change",
+       title="Reference vs. Shuffled Translational Change",
+       x="Log2 Fold Change in Translation",
+       y="-log10(FDR)")+
+  geom_vline(xintercept = -log2(1.25),linetype="dashed")+
+  geom_vline(xintercept = log2(1.25),linetype="dashed")+
+  geom_hline(yintercept = -log10(0.05),linetype="dashed")+
+  theme(legend.position = "none",aspect.ratio=1)
+
+export_graph_start("./Figures/Figure_4/AllRefvsShuf_VolcanoPlot_Patchwork_fig4A-D.pdf",sideways = TRUE,height = 0.5)
+print(p1_shuf+theme(legend.position = "none")+labs(title=NULL,subtitle="Pre-Splicing",x="Log2FC Expression")+
+        p2_shuf+theme(legend.position = "none")+labs(title=NULL,subtitle="Post-Splicing",x="Log2FC Expression")+
+        p3_shuf+theme(legend.position = "none")+labs(title=NULL,subtitle="Stability",x="Log2FC Stability")+
+        p4_shuf+theme(legend.position = "none")+labs(title=NULL,subtitle="Translational",x="Log2FC TE")+
+        plot_layout(ncol=4)+plot_annotation(title="Reference vs. Shuffled"))
+export_graph_end()
+```
+
+###Figure 4G
+```{r figure_4G}
+# The code for figure 4G must be run before running the code for 4F
+#False positive analysis
+exon_stability <- inner_join(exon_shuf,stability_shuf,"Element")
+
+#Significant in both and same direction
+true_positives <- filter(exon_stability,
+                         fdr.x<0.1,
+                         fdr.y<0.1,
+                         ((logFC.x>0 & logFC.y>0) | (logFC.x<0 & logFC.y<0))
+                         )$Element
+#Only significant in stability, not post-splicing
+false_negatives <- filter(exon_stability,
+                         fdr.x>0.1,
+                         fdr.y<0.1)$Element
+#Either only significant in post-splicing, or significant in both but opposite
+#directions
+false_positives <- c(
+  filter(exon_stability,
+         fdr.x<0.1,
+         fdr.y>0.1)$Element,
+  filter(exon_stability,
+         fdr.x<0.1,
+         fdr.y<0.1,
+         ((logFC.x>0 & logFC.y<0) | (logFC.x<0 & logFC.y>0)))$Element)
+  
+
+
+
+
+all_else <- filter(stability_shuf,
+                   !Element %in% false_positives,
+                   !Element %in% false_negatives,
+                   !Element %in% true_positives)$Element
+
+plottable <- rbind(
+  data.table("Element"=true_positives,"Category"="True Positive"),
+  data.table("Element"=false_positives,"Category"="False Positive"),
+  data.table("Element"=false_negatives,"Category"="False Negative"),
+  data.table("Element"=all_else,"Category"="Not Significant")
+)
+
+plottable[,Category := factor(Category,levels=c("True Positive","False Positive","False Negative","Not Significant"))]
+
+summary_data <- plottable %>%
+  group_by(Category) %>%
+  summarise(count = n()) %>%
+  mutate(percentage = count / sum(count) * 100)
+
+# Separate the data for labels
+label_data <- summary_data %>%
+  filter(Category != "Not Significant") %>%
+  mutate(cumulative_percentage = 100 - cumsum(percentage) + percentage/2)
+
+# Create the plot
+
+p5_shuf <- ggplot(summary_data, aes(x = "", y = percentage, fill = Category)) +
+  geom_col(width = 0.4, color = "black") +
+  scale_fill_manual(values = c("Not Significant" = "lightgrey",
+                               "True Positive" = "#136d52",
+                               "False Positive" = "#21c494",
+                               "False Negative" = "#67e5bf")) +
+  labs(y = "Percentage",
+       fill = "Category",
+       x=NULL) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+        legend.position = "right",
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+export_graph_start("./Figures/Figure_4/RefShuf_Accuracy_fig4G.pdf",width=0.75)
+print(p5_shuf+theme_minimal())
+ggplot(summary_data,aes(Category,count,fill=as.factor(count)))+
+  geom_col()+
+  geom_text(aes(y=count-100,label=paste0(round(percentage,2),"\n",count)))+
+  theme(axis.text.x = element_text(angle = 45,hjust=1))
+export_graph_end()
+```
+
+###Figure 4F
+```{r figure_4F}
+exon_stability <- left_join(exon_stability,plottable)
+exon_stability <- unique.data.frame(exon_stability)
+p5_shuf_dotplot <- ggplot(exon_stability,aes(x=logFC.x,y=logFC.y,fill=Category))+
+  geom_point(shape=21,alpha=0.5,size=3)+
+  scale_fill_manual(values = c("Not Significant" = "lightgrey",
+                               "True Positive" = "#136d52",
+                               "False Positive" = "#21c494",
+                               "False Negative" = "#67e5bf"))+
+  labs(x="Log Fold Change\n(Post-Splice)",
+       y="Log Fold Change\n(Stability)",
+       )+
+  theme_bw()+
+  theme(legend.position = "none",aspect.ratio = 1)
+print(p5_shuf_dotplot)
+
+export_graph_start("./Figures/Figure_4/logfcpostvsstab_refshuf_fig4F.pdf")
+print(p5_shuf_dotplot + coord_fixed(ratio=1.979))
+export_graph_end()
+```
+
+###Figure 4H-K
+```{figure4_h-k}
+intron <- fread("../analysis/ActD Trials/Full_Library_08Apr2026/PreSplicing_RefAlt_LM.txt") %>% .[,plotcolor := as.factor(case_when(
+    (abs(logFC)>log2(1.25) & fdr<0.1) ~ 1,
+    TRUE ~ 2))]
+
+exon <- fread("../analysis/ActD Trials/Full_Library_08Apr2026/PostSplicing_RefAlt_LM.txt") %>% .[,plotcolor := as.factor(case_when(
+    (abs(logFC)>log2(1.25) & fdr<0.1) ~ 1,
+    TRUE ~ 2))]
+
+stability <- fread("../analysis/ActD Trials/Full_Library_08Apr2026/Stability_RefAlt_LM.txt") %>%
+  mutate(logFC_interaction = -(logFC_interaction)) %>%
+  .[,plotcolor := as.factor(case_when(
+    (abs(logFC_interaction)>log2(1.25) & fdr_interaction<0.1) ~ 1,
+    TRUE ~ 2))]
+
+translational <- fread("../analysis/Library1and2BCLess_ISOMPRA_6-30-2022/Translation_Splicing-Agnostic_RefvsAlt_LM_Annotated.tsv") %>% .[,plotcolor := as.factor(case_when(
+    (abs(logFC)>log2(1.25) & fdr<0.1) ~ 1,
+    TRUE ~ 2))]
+
+# Define some points we want to label on the plots
+# Specifically, intron points that are transcriptional only,
+# exon points that are a mix of transcriptional only and stability sig
+# all or nearly all the stability points
+# all the translational points
+
+intron_elems <- filter(stability, fdr_allele < 0.1, fdr_interaction > 0.1) %>% 
+  as.data.table() %>% 
+  .[order(abs(fdr_allele))] %>% 
+  head(4) %>% pull(Element)
+
+exon_elems <- filter(stability, fdr_interaction < 0.1) %>% 
+  as.data.table() %>% 
+  .[order(abs(fdr_allele))] %>% 
+  head(4) %>% pull(Element)
+
+stability_elems <- filter(stability,fdr_interaction<0.1) %>% as.data.table() %>%
+  .[order(abs(fdr_interaction))] %>% head(10) %>% pull(Element)
+
+translational_elems <- filter(translational,fdr<0.1) %>% as.data.table() %>%
+  .[order(-abs(logFC))] %>% head(10) %>% pull(Element)
+
+p1 <- ggplot(intron)+
+  geom_point(aes(x=logFC,y=-log10(fdr),fill=plotcolor,shape=Pheno),size=2)+
+  scale_fill_manual(values=c(cbPalette[1],"lightgray"),
+                    labels=c("Increased Expression","Decreased Expression",
+                             "Not Significant"))+
+  scale_shape_manual(values = c(21,23))+
+  labs(fill="Expression Change",
+       title="Reference vs. Variant Expression Change\nin Pre-Splicing Pool",
+       x="Log2 Fold Change in Expression",
+       y="-log10(FDR)")+
+  geom_vline(xintercept = -log2(1.25),linetype="dashed")+
+  geom_vline(xintercept = log2(1.25),linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1),linetype="dashed")+
+  theme(legend.position = "none",aspect.ratio = 1)+
+  geom_text_repel(data = filter(intron,Element %in% intron_elems),
+                  aes(x=logFC,y=-log10(fdr),label=Symbol))
+print(p1)
+
+p2 <- ggplot(exon)+
+  geom_point(aes(x=logFC,y=-log10(fdr),fill=plotcolor,shape=Pheno),size=2)+
+  scale_fill_manual(values=c(cbPalette[1],"lightgray"),
+                    labels=c("Increased Expression","Decreased Expression",
+                             "Not Significant"))+
+  scale_shape_manual(values=c(21,23))+
+  labs(fill="Expression Change",
+       title="Reference vs. Variant Expression Change\nin Post-Splicing Pool",
+       x="Log2 Fold Change in Expression",
+       y="-log10(FDR)")+
+  geom_vline(xintercept = -log2(1.25),linetype="dashed")+
+  geom_vline(xintercept = log2(1.25),linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1),linetype="dashed")+
+  theme(legend.position = "none",aspect.ratio = 1)+
+  geom_text_repel(data = filter(exon,(Element %in% intron_elems | Element %in% exon_elems)),
+                  aes(x=logFC,y=-log10(fdr),label=Symbol))
+print(p2)
+
+p3 <- ggplot(stability)+
+  geom_point(aes(x=logFC_interaction,y=-log10(fdr_interaction),fill=plotcolor,shape=Pheno),size=2)+
+  scale_fill_manual(values=c(cbPalette[1],"lightgrey"),
+                    labels=c("Increased Stability","Decreased Stability",
+                             "Not Significant"))+
+  scale_shape_manual(values=c(21,23))+
+  labs(fill="Stability Change",
+       title="Reference vs. Variant Stability Change",
+       x="Log2 Fold Change in Stability",
+       y="-log10(FDR)")+
+  geom_vline(xintercept = -log2(1.25),linetype="dashed")+
+  geom_vline(xintercept = log2(1.25),linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1),linetype="dashed")+
+  theme(legend.position = "none",aspect.ratio = 1)+
+  geom_text_repel(data = filter(stability,Element %in% stability_elems),
+                  aes(x=logFC_interaction,y=-log10(fdr_interaction),label=Symbol))
+print(p3)
+
+p4 <- ggplot(translational)+
+  geom_point(aes(x=logFC,y=-log10(fdr),fill=plotcolor,shape = Pheno),size=2)+
+  scale_fill_manual(values=c(cbPalette[1],"lightgrey"),
+                    labels=c("Increased Translation","Decreased Translation",
+                             "Not Significant"))+
+  scale_shape_manual(values=c(21,23))+
+  labs(fill="Translational Change",
+       title="Reference vs. Variant Translational Change",
+       x="Log2 Fold Change in Translation",
+       y="-log10(FDR)")+
+  geom_vline(xintercept = -log2(1.25),linetype="dashed")+
+  geom_vline(xintercept = log2(1.25),linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1),linetype="dashed")+
+  guides(fill="none")+
+  theme(aspect.ratio = 1)+
+  geom_text_repel(data = filter(translational,Element %in% translational_elems),
+                  aes(x=logFC,y=-log10(fdr),label=Symbol))+
+  labs(shape="Phenotype")
+print(p4)
+
+export_graph_start("./Figures/Figure_4/AllRefvsAlt_VolcanoPlot_Patchwork_New_fig_4h-k.pdf",sideways = TRUE,height = 0.5)
+print(p1+theme(legend.position = "none")+labs(title=NULL,subtitle="Pre-Splicing",x="Log2FC Expression")+
+        p2+theme(legend.position = "none")+labs(title=NULL,subtitle="Post-Splicing",x="Log2FC Expression")+
+        p3+theme(legend.position = "none")+labs(title=NULL,subtitle="Stability",x="Log2FC Stability")+
+        p4+theme(legend.position = "none")+labs(title=NULL,subtitle="Translational",x="Log2FC TE")+
+        plot_layout(ncol=4)+plot_annotation(title="Reference vs. Variant"))
+export_graph_end()
+```
+
+###Figure 4M
+```{figure_4M}
+# As before, 4M must be run before 4L
+#False positive analysis
+exon_stability <- inner_join(exon,stability,"Element")
+
+#Significant in both and same direction
+true_positives <- filter(exon_stability,
+                         fdr<0.1,
+                         fdr_interaction<0.1,
+                         ((logFC>0 & logFC_interaction>0) | (logFC<0 & logFC_interaction<0))
+                         )$Element
+#Only significant in stability, not post-splicing
+false_negatives <- filter(exon_stability,
+                         fdr>0.1,
+                         fdr_interaction<0.1)$Element
+#Either only significant in post-splicing, or significant in both but opposite
+#directions
+false_positives <- c(
+  filter(exon_stability,
+         fdr<0.1,
+         fdr_interaction>0.1)$Element,
+  filter(exon_stability,
+         fdr<0.1,
+         fdr_interaction<0.1,
+         ((logFC>0 & logFC_interaction<0) | (logFC<0 & logFC_interaction>0)))$Element)
+  
+
+
+
+
+all_else <- filter(stability_shuf,
+                   !Element %in% false_positives,
+                   !Element %in% false_negatives,
+                   !Element %in% true_positives)$Element
+
+plottable <- rbind(
+  data.table("Element"=true_positives,"Category"="True Positive"),
+  data.table("Element"=false_positives,"Category"="False Positive"),
+  data.table("Element"=false_negatives,"Category"="False Negative"),
+  data.table("Element"=all_else,"Category"="Not Significant")
+)
+
+plottable[,Category := factor(Category,levels=c("True Positive","False Positive","False Negative","Not Significant"))]
+
+summary_data <- plottable %>%
+  group_by(Category) %>%
+  summarise(count = n()) %>%
+  mutate(percentage = count / sum(count) * 100)
+
+# Separate the data for labels
+label_data <- summary_data %>%
+  filter(Category != "Not Significant") %>%
+  mutate(cumulative_percentage = 100 - cumsum(percentage) + percentage/2)
+
+# Create the plot
+
+p5 <- ggplot(summary_data, aes(x = "", y = percentage, fill = Category)) +
+  geom_col(width = 0.4, color = "black") +
+  scale_fill_manual(values = c("Not Significant" = "lightgrey",
+                               "True Positive" = "#136d52",
+                               "False Positive" = "#21c494",
+                               "False Negative" = "#67e5bf")) +
+  labs(y = "Percentage",
+       fill = "Category",
+       x=NULL) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+        legend.position = "right",
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+export_graph_start("./Figures/Figure_4/RefAlt_Accuracy_fig4M.pdf",width=0.75)
+print(p5+theme_minimal())
+ggplot(summary_data,aes(Category,count,fill=as.factor(count)))+
+  geom_col()+
+  geom_text(aes(y=count-100,label=paste0(round(percentage,2),"\n",count)))+
+  theme(axis.text.x = element_text(angle = 45,hjust=1))
+export_graph_end()
+```
+
+###Figure 4L
+```{r figure_4L}
+exon_stability <- left_join(exon_stability,plottable)
+exon_stability <- unique.data.frame(exon_stability)
+p5_dotplot <- ggplot(exon_stability,aes(x=logFC,y=logFC_interaction,fill=Category))+
+  geom_point(shape=21,alpha=0.5,size=3)+
+  scale_fill_manual(values = c("Not Significant" = "lightgrey",
+                               "True Positive" = "#136d52",
+                               "False Positive" = "#21c494",
+                               "False Negative" = "#67e5bf"))+
+  labs(x="Log Fold Change\n(Post-Splice)",
+       y="Log Fold Change\n(Stability)",
+       )+
+  theme_bw()+
+  theme(legend.position = "none",aspect.ratio = 1)
+print(p5_dotplot)
+
+export_graph_start("./Figures/Figure_4/logfcpostvsstab_refvsalt_4L.pdf")
+print(p5_dotplot)
+export_graph_end()
+```
+
+###Figure 4N-P
+```{r figure4_N-P}
+badAlt<-c('ZNF626_wgs','ASIC2_wgs', 'CDKN2B_wgs', 'ELMO1_wgs', 'ENPP5_wgs', 'GDPD4_ssc', 'INSR_wgs', 'LMBRD2_wgs', 'LRP2BP_wgs', 'SCARB2.1_wgs', 'TLK1_wgs', 'TRIM37_wgs', 'ZCCHC11_wgs')
+d <- fread("../data/formatted/ActD_Trials_08Apr2026/formatted.txt") %>% filter(,!Element %in% badAlt)
+
+#Separate allele names
+d <- d %>%
+  separate_wider_regex(
+    cols = Element,
+    patterns = c(
+      Element = ".*",        # Match as much as possible (greedy)
+      "_",                   # Match the last underscore
+      Allele = "[^_]+"       # Match everything remaining that isn't an underscore
+    )
+  )
+d <- as.data.table(d)
+
+#Grab the DNA info
+dna <- fread("../data/formatted/Library1and2BCLess_ISOMPRA_6-30-2022/formatted_Reads_compiled_06-30-2022.tsv") %>% filter(Fraction=="DNA")
+dna <- dna %>% group_by(Element,Allele) %>% summarize(CPM=mean(CPM)) %>% as.data.table()
+#Put the DNA info in the table, adjoining to correct element
+d <- as.data.table(left_join(d,dna,by=c("Element","Allele")))
+#Calculate expression
+d[, Expression := log2(CPM.x/CPM.y)]
+#Get rid of non-finite values
+d <- filter(d,is.finite(Expression))
+d <- filter(d,Fraction=="0hr",!(Splicing=="Pre" & BiolRep==3))
+data_for_concordancy <- d #For later Figure S6
+common_y <- c(
+  min(filter(d,Element=="MLXIP_wgs", is.finite(Expression))$Expression),
+  max(filter(d,Element=="MLXIP_wgs", is.finite(Expression))$Expression)
+)
+
+library(ggtext)
+#Grab GALNTL5 variant, that was a good one
+pre_boxplot <- ggplot(
+  filter(d,Element=="MLXIP_wgs",Splicing=="pre") %>%
+    mutate(Splicing=factor(Splicing,levels=c("pre","post"),labels=c("Pre","Post"))) %>%
+    mutate(Allele=factor(Allele,levels=c("ref","alt"),labels=c("Reference","Variant"))),
+  aes(x=Allele,y=Expression,fill=Allele))+
+  geom_boxplot()+
+  geom_point(shape=21)+
+  scale_fill_manual(values = c("#136d52","#67e5bf"))+
+  guides(fill="none")+
+  theme(plot.title = element_text(hjust=0.5))+
+  labs(title="Pre-Splicing",y = "Expression: Log<sub>2</sub> (<sup>RNA</sup>&frasl;<sub>DNA</sub>)") +
+  theme(axis.title.y = element_markdown(),aspect.ratio = 2)+
+  ylim(common_y)
+print(pre_boxplot)
+
+post_boxplot <- ggplot(
+  filter(d,Element=="MLXIP_wgs",Splicing=="post") %>%
+    mutate(Splicing=factor(Splicing,levels=c("pre","post"),labels=c("Pre","Post"))) %>%
+    mutate(Allele=factor(Allele,levels=c("ref","alt"),labels=c("Reference","Variant"))),
+  aes(x=Allele,y=Expression,fill=Allele))+
+  geom_boxplot()+
+  geom_point(shape=21)+
+  scale_fill_manual(values = c("#136d52","#67e5bf"))+
+  guides(fill="none")+
+  theme(plot.title = element_text(hjust=0.5))+
+  labs(title="Post-Splicing", y = "Expression: Log<sub>2</sub> (<sup>RNA</sup>&frasl;<sub>DNA</sub>)")+
+  theme(axis.title.y = element_markdown())+
+  theme(axis.title.y = element_blank(),aspect.ratio = 2)+
+  ylim(common_y)
+print(post_boxplot)
+
+stab_boxplot <- ggplot(
+  filter(d, Element == "MLXIP_wgs")%>%
+    mutate(Splicing=factor(Splicing,levels=c("pre","post"),labels=c("Pre","Post"))) %>%
+    mutate(Allele=factor(Allele,levels=c("ref","alt"),labels=c("Reference","Variant"))),
+  aes(x = Splicing, y = Expression, fill = Allele)
+) +
+  # 1. Four distinct boxplots
+  # We use position_dodge to separate Ref and Alt at each x-axis tick
+  geom_boxplot(
+    aes(group = interaction(Splicing, Allele)),
+    position = position_dodge(width = 0.8),
+    outlier.shape = NA
+  ) +
+  
+  # 2. Dots centered over each of the four boxes
+  geom_point(
+    aes(group = interaction(Splicing, Allele)),
+    position = position_dodge(width = 0.8), 
+    shape = 21, 
+    color = "black"
+  ) +
+  
+  # 3. Lines connecting Pre-Ref to Post-Ref and Pre-Alt to Post-Alt
+  # We use group = Allele here so it ignores the Splicing split for the line
+  stat_summary(
+    fun = median, 
+    geom = "line", 
+    aes(group = Allele, color = Allele), 
+    linewidth = 1,
+    position = position_dodge(width = 0.8) # Matches the boxplot shift
+  ) +
+  
+  scale_fill_manual(values = c("#136d52", "#67e5bf")) +
+  scale_color_manual(values = c("#136d52", "#67e5bf"))+
+  guides(fill="none",color="none")+
+  theme(plot.title = element_text(hjust=0.5))+
+  labs(title="Stability",y = "Expression: Log<sub>2</sub> (<sup>RNA</sup>&frasl;<sub>DNA</sub>)") +
+  theme(axis.title.y = element_markdown())+
+  theme(axis.title.y = element_blank(),aspect.ratio = 2)+
+  ylim(common_y)
+print(stab_boxplot)
+
+export_graph_start("./Figures/Figure_4/Figure_4N-P.pdf")
+pre_boxplot+post_boxplot+stab_boxplot
+export_graph_end()
+```
+
+##Case vs Control Bias in Singificant Variants
+###Pre-Splicing
+```{r case_control_bias_pre}
+
+mat <- matrix(
+  c(length(filter(intron,fdr<0.1,Pheno=="case")$Element),
+    length(filter(intron,fdr<0.1,Pheno=="control")$Element),
+    length(filter(intron,fdr>0.1,Pheno=="case")$Element),
+    length(filter(intron,fdr>0.1,Pheno=="control")$Element)), 
+  nrow = 2,
+  dimnames = list(
+    Variant = c("Case", "Control"),
+    Status = c("Significant", "NonSignificant")
+  )
+)
+fisher.test(mat,alternative = "greater")
+```
+
+###Post-Splicing
+```{r case_control_bias_post}
+mat <- matrix(
+  c(length(filter(exon,fdr<0.1,Pheno=="case")$Element),
+    length(filter(exon,fdr<0.1,Pheno=="control")$Element),
+    length(filter(exon,fdr>0.1,Pheno=="case")$Element),
+    length(filter(exon,fdr>0.1,Pheno=="control")$Element)), 
+  nrow = 2,
+  dimnames = list(
+    Variant = c("Case", "Control"),
+    Status = c("Significant", "NonSignificant")
+  )
+)
+fisher.test(mat,alternative = "greater")
+```
+
+###Stability
+```{r case_control_bias_stability}
+mat <- matrix(
+  c(length(filter(stability,fdr_interaction<0.1,Pheno=="case")$Element),
+length(filter(stability,fdr_interaction<0.1,Pheno=="control")$Element),
+length(filter(stability,fdr_interaction>0.1,Pheno=="case")$Element),
+length(filter(stability,fdr_interaction>0.1,Pheno=="control")$Element)), 
+  nrow = 2,
+  dimnames = list(
+    Variant = c("Case", "Control"),
+    Status = c("Significant", "NonSignificant")
+  )
+)
+
+fisher.test(mat,alternative = "greater")
+```
+
+###Transcriptional-Only
+```{r case_control_bias_transcriptional}
+mat <- matrix(
+  c(
+    length(filter(stability,fdr_interaction>0.1,fdr_allele<0.1,Pheno=="case")$Element),
+    length(filter(stability,fdr_interaction>0.1,fdr_allele<0.1,Pheno=="control")$Element),
+    length(filter(stability,fdr_interaction>0.1,fdr_allele>0.1,Pheno=="case")$Element),
+    length(filter(stability,fdr_interaction>0.1,fdr_allele>0.1,Pheno=="control")$Element)), 
+  nrow = 2,
+  dimnames = list(
+    Variant = c("Case", "Control"),
+    Status = c("Significant", "NonSignificant")
+  )
+)
+
+fisher.test(mat,alternative = "greater")
+#Cleanup
+rm(list = setdiff(ls(), lsf.str()))
+
+```
+
+##Figure 6
+
+```{r create_dir}
+dir.create("./Figures/Figure_6")
+```
+
+###Figure 6B
+```{r figure_6b}
+cbPalette <- brewer.pal(8,"Dark2")
+d <- fread("../data/formatted/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/formatted_Reads_08Mar2024.tsv") %>% filter(Cre_Type=="VGlut1") %>% mutate(CPM=log2(CPM+1))
+
+d_wide <- pivot_wider(d,
+                      id_cols = c("Element","Allele"),
+                      names_from = c("Splicing_Pool","Cre_Status","Animal_Hemisphere"),
+                      values_from = CPM)
+
+# 1. Isolate the numeric values (skipping 'Element' and 'Allele' columns)
+# If column 1 is an empty row name string "", we drop columns 1, 2, and 3
+data_matrix <- as.matrix(d_wide[, -c(1, 2)])
+
+# 2. Extract metadata directly from the wide column names
+col_metadata <- data.frame(ColName = colnames(data_matrix)) %>%
+  mutate(
+    # Split the names by the underscores
+    Splicing  = sub("^([^_]+)_.*$", "\\1", ColName),     # "Pre" or "Post"
+    CreStatus = sub("^[^_]+_([^_]+)_.*$", "\\1", ColName), # "ON" or "OFF"
+    BiolRep   = sub("^[^_]+_[^_]+_(.*)$", "\\1", ColName)   # "10L", "10R", "1L", etc.
+  ) %>%
+  # Combine Splicing and CreStatus into your 4 true biological treatment groups
+  mutate(BioGroup = paste(Splicing, CreStatus, sep = "_"))
+
+# 3. Create the protective design matrix
+# This shields your 4 biological conditions from being crushed or flattened
+design_matrix <- model.matrix(~ 0 + BioGroup, data = col_metadata)
+
+# 4. Define the batch factor using the true physical RNA pool source
+# This tells limma to pair columns that share the exact same tissue tube (e.g., "10L")
+batch_factor <- col_metadata$BiolRep
+
+# 5. Run the unconfounded batch correction
+corrected_matrix <- removeBatchEffect(
+  data_matrix,
+  batch = batch_factor,
+  design = design_matrix
+)
+
+mds_invivo <- limma::plotMDS(corrected_matrix)
+
+mds_invivo_df <- data.frame(
+  SampleID = colnames(corrected_matrix),
+  Dim1 = mds_invivo$x,
+  Dim2 = mds_invivo$y
+)
+
+mds_invivo_df <- tidyr::separate(mds_invivo_df,SampleID,c("Splicing","Cre","BiolRep"),sep="_")
+mds_invivo_df <- tidyr::unite(mds_invivo_df,"Library",c("Splicing","Cre")) %>% as.data.table()
+mds_invivo_df[,Library := factor(Library,
+                                 levels = c(
+                                   "Pre_OFF",
+                                   "Post_OFF",
+                                   "Pre_ON",
+                                   "Post_ON"),
+                                 labels = c(
+                                   "Cre(-) Cells,\nPre-Splicing",
+                                   "Cre(-) Cells,\nPost-Splicing",
+                                   "Cre(+) Cells,\nPre-Splicing",
+                                   "Cre(+) Cells,\nPost-Splicing"
+                                 ))]
+
+# Calculate the total variance
+total_var <- sum(mds_invivo$eigen.values)
+
+# Calculate percentage for Dim 1 and Dim 2
+var_pc1 <- (mds_invivo$eigen.values[1] / total_var) * 100
+var_pc2 <- (mds_invivo$eigen.values[2] / total_var) * 100
+
+
+
+export_graph_start("./Figures/Figure_6/MDS Plot log2 CPM Batch Corrected_fig_6b.pdf")
+ggplot(mds_invivo_df,aes(x=Dim1,y=Dim2,fill=Library))+geom_point(shape=21,size=3)+
+  geom_polygon(stat = "ellipse",alpha=0.2,color="black")+
+  labs(x=paste0("Leading logFC dim 1 (",round(var_pc1,0),"%)"),
+       y=paste0("Leading logFC dim 2 (",round(var_pc2,0),"%)"))
+export_graph_end()
+```
+
+###Figure 6C-E
+```{r figure_6c-e}
+
+shufdata <- rbind(
+  fread("../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Pre-Splicing_Vglut1_CreOFF_RefvsShuf_Welchs.tsv") %>% mutate(Splicing_Pool="Pre",Cre_Status="Off"),
+  fread("../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Pre-Splicing_Vglut1_CreON_RefvsShuf_Welchs.tsv") %>% mutate(Splicing_Pool="Pre",Cre_Status="On"),
+fread("../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Post-Splicing_Vglut1_CreOFF_RefvsShuf_Welchs.tsv") %>% mutate(Splicing_Pool="Post",Cre_Status="Off"),
+fread("../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Post-Splicing_Vglut1_CreON_RefvsShuf_Welchs.tsv") %>% mutate(Splicing_Pool="Post",Cre_Status="On"),
+fread("../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Stability_Vglut1_CreOFF_RefvsShuf_Welchs.tsv") %>% mutate(Splicing_Pool="Stability",Cre_Status="Off"),
+fread("../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Stability_Vglut1_CreON_RefvsShuf_Welchs.tsv") %>% mutate(Splicing_Pool="Stability",Cre_Status="On"))
+shufdata <- shufdata %>% .[,plotcolor := as.factor(case_when(
+    (logFC>log2(1.25) & fdr<0.1) ~ 1,
+    (logFC<log2(0.75) & fdr<0.1) ~ 2,
+    TRUE ~ 3))]
+shufdata[,Splicing_Pool := factor(Splicing_Pool,levels = c("Pre","Post","Stability"))]
+shufdata[,Cre_Status := factor(Cre_Status,levels = c("Off","On"),labels = c("Whole Cortex","Excitatory Neurons"))]
+
+p1_shuf_OFF <- ggplot(filter(shufdata,Splicing_Pool=="Pre",Cre_Status=="Whole Cortex"))+
+  geom_point(aes(x=logFC,y=-log10(fdr),fill=plotcolor),shape=21,size=2)+
+  scale_fill_manual(values=c(cbPalette[1],cbPalette[1],"lightgrey"),
+                    labels=c("Increased Expression","Decreased Expression",
+                             "Not Significant"))+
+  labs(fill="Expression Change",
+       title="Variant vs. Reference Expression Change\nin Pre-Splicing Pool",
+       x="Log2 Fold Change in Expression",
+       y="-log10(FDR)")+
+  geom_vline(xintercept = -log2(1.25),linetype="dashed")+
+  geom_vline(xintercept = log2(1.25),linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1),linetype="dashed")
+p1_shuf_OFF
+
+p2_shuf_OFF <- ggplot(filter(shufdata,Splicing_Pool=="Post",Cre_Status=="Whole Cortex"))+
+  geom_point(aes(x=logFC,y=-log10(fdr),fill=plotcolor),shape=21,size=2)+
+  scale_fill_manual(values=c(cbPalette[1],cbPalette[1],"lightgrey"),
+                    labels=c("Increased Expression","Decreased Expression",
+                             "Not Significant"))+
+  labs(fill="Expression Change",
+       title="Variant vs. Reference Expression Change\nin Pre-Splicing Pool",
+       x="Log2 Fold Change in Expression",
+       y="-log10(FDR)")+
+  geom_vline(xintercept = -log2(1.25),linetype="dashed")+
+  geom_vline(xintercept = log2(1.25),linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1),linetype="dashed")
+p2_shuf_OFF
+
+p3_shuf_OFF <- ggplot(filter(shufdata,Splicing_Pool=="Stability",Cre_Status=="Whole Cortex"))+
+  geom_point(aes(x=logFC,y=-log10(fdr),fill=plotcolor),shape=21,size=2)+
+  scale_fill_manual(values=c(cbPalette[1],cbPalette[1],"lightgrey"),
+                    labels=c("Increased Expression","Decreased Expression",
+                             "Not Significant"))+
+  labs(fill="Expression Change",
+       title="Variant vs. Reference Expression Change\nin Pre-Splicing Pool",
+       x="Log2 Fold Change in Expression",
+       y="-log10(FDR)")+
+  geom_vline(xintercept = -log2(1.25),linetype="dashed")+
+  geom_vline(xintercept = log2(1.25),linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1),linetype="dashed")
+p3_shuf_OFF
+
+export_graph_start("./Figures/Figure_6/RefvsShuf_All_CreOFF_fig6c-e.pdf",sideways=TRUE,height=0.5)
+print(p1_shuf_OFF+theme(legend.position = "none")+labs(title=NULL,subtitle="Pre-Splicing",x="Log2FC Expression")+
+        p2_shuf_OFF+theme(legend.position = "none")+labs(title=NULL,subtitle="Post-Splicing",x="Log2FC Expression")+
+        p3_shuf_OFF+theme(legend.position = "none")+labs(title=NULL,subtitle="Stability",x="Log2FC Stability")+
+        plot_layout(ncol=3)+plot_annotation(title="Reference vs. Shuffled"))
+export_graph_end()
+```
+
+###Figure 6F
+```{r figure_6F}
+#False positive analysis
+exon_stability <- inner_join(
+  filter(shufdata,Splicing_Pool=="Post",Cre_Status=="Whole Cortex"),
+  filter(shufdata,Splicing_Pool=="Stability",Cre_Status=="Whole Cortex"),
+  "Element")
+
+
+#Significant in both and same direction
+true_positives <- filter(exon_stability,
+                         fdr.x<0.1,
+                         fdr.y<0.1,
+                         ((logFC.x>0 & logFC.y>0) | (logFC.x<0 & logFC.y<0))
+                         )$Element
+#Only significant in stability, not post-splicing
+false_negatives <- filter(exon_stability,
+                         fdr.x>0.1,
+                         fdr.y<0.1)$Element
+#Either only significant in post-splicing, or significant in both but opposite
+#directions
+false_positives <- c(
+  filter(exon_stability,
+         fdr.x<0.1,
+         fdr.y>0.1)$Element,
+  filter(exon_stability,
+         fdr.x<0.1,
+         fdr.y<0.1,
+         ((logFC.x>0 & logFC.y<0) | (logFC.x<0 & logFC.y>0)))$Element)
+  
+
+
+
+
+all_else <- filter(exon_stability,
+                   !Element %in% false_positives,
+                   !Element %in% false_negatives,
+                   !Element %in% true_positives)$Element
+
+plottable <- rbind(
+  data.table("Element"=true_positives,"Category"="True Positive"),
+  data.table("Element"=false_positives,"Category"="False Positive"),
+  data.table("Element"=false_negatives,"Category"="False Negative"),
+  data.table("Element"=all_else,"Category"="Not Significant")
+)
+
+plottable[,Category := factor(Category,levels=c("True Positive","False Positive","False Negative","Not Significant"))]
+
+summary_data <- plottable %>%
+  group_by(Category) %>%
+  summarise(count = n()) %>%
+  mutate(percentage = count / sum(count) * 100)
+
+# Separate the data for labels
+label_data <- summary_data %>%
+  filter(Category != "Not Significant") %>%
+  mutate(cumulative_percentage = 100 - cumsum(percentage) + percentage/2)
+
+# Create the plot
+
+p5_shuf <- ggplot(summary_data, aes(x = "", y = percentage, fill = Category)) +
+  geom_col(width = 0.4, color = "black") +
+  scale_fill_manual(values = c("Not Significant" = "lightgrey",
+                               "True Positive" = "#136d52",
+                               "False Positive" = "#21c494",
+                               "False Negative" = "#67e5bf")) +
+  labs(y = "Percentage",
+       fill = "Category",
+       x=NULL) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+        legend.position = "right",
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+export_graph_start("./Figures/Figure_6/RefShuf_Accuracy_CreOFF_fig6f.pdf",width=0.75)
+print(p5_shuf+theme_minimal())
+ggplot(summary_data,aes(Category,count,fill=as.factor(count)))+
+  geom_col()+
+  geom_text(aes(y=count-100,label=paste0(round(percentage,2),"\n",count)))+
+  theme(axis.text.x = element_text(angle = 45,hjust=1))
+export_graph_end()
+
+exon_stability <- left_join(exon_stability,plottable)
+exon_stability <- unique.data.frame(exon_stability)
+cortex_shuf_dotplot <- ggplot(exon_stability,aes(x=logFC.x,y=logFC.y,fill=Category))+
+  geom_point(shape=21,alpha=0.5,size=3)+
+  scale_fill_manual(values = c("Not Significant" = "lightgrey",
+                               "True Positive" = "#136d52",
+                               "False Positive" = "#21c494",
+                               "False Negative" = "#67e5bf"))+
+  labs(x="Log Fold Change\n(Post-Splice)",
+       y="Log Fold Change\n(Stability)",
+       )+
+  theme_bw()+
+  theme(legend.position = "none")
+print(cortex_shuf_dotplot)
+export_graph_start("./Figures/Figure_6/Cortex_RefShuf_PostvsStability_DotPlot_fig6f.pdf")
+print(cortex_shuf_dotplot + 
+        coord_fixed(ratio = 
+    diff(range(exon_stability$logFC.x[is.finite(exon_stability$logFC.x)])) / 
+    diff(range(exon_stability$logFC.y[is.finite(exon_stability$logFC.y)]))))
+export_graph_end()
+```
+
+###Figure 6G-I
+```{r figure6_g-i}
+#Read in LM results and set a plotting value based on significance and logFC
+intron_OFF <- filter(fread("../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Pre-Splicing_Vglut1_CreOFF_RefvsAlt_LM_Annotated.tsv"),is.finite(fdr)) %>%
+  .[,plotcolor := as.factor(case_when(
+    (logFC>log2(1.25) & fdr<0.1) ~ 1,
+    (logFC<-log2(1.25) & fdr<0.1) ~ 2,
+    TRUE ~ 3))]
+
+exon_OFF <- filter(fread("../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Post-Splicing_Vglut1_CreOFF_RefvsAlt_LM_Annotated.tsv"),is.finite(fdr))%>%
+  .[,plotcolor := as.factor(case_when(
+    (logFC>log2(1.25) & fdr<0.1) ~ 1,
+    (logFC<-log2(1.25) & fdr<0.1) ~ 2,
+    TRUE ~ 3))]
+
+stability_OFF <- filter(fread("../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Stability_Vglut1_CreOFF_RefvsAlt_LM_Annotated.tsv"),is.finite(fdr_interaction)) %>%
+  mutate(logFC_interaction = -(logFC_interaction)) %>%
+  .[,plotcolor := as.factor(case_when(
+    (logFC_interaction>log2(1.25) & fdr_interaction<0.1) ~ 1,
+    (logFC_interaction<-log2(1.25) & fdr_interaction<0.1) ~ 2,
+    TRUE ~ 3))]
+
+intron_ON <- filter(fread("../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Pre-Splicing_Vglut1_CreON_RefvsAlt_LM_Annotated.tsv"),is.finite(fdr)) %>%
+  .[,plotcolor := as.factor(case_when(
+    (logFC>log2(1.25) & fdr<0.1) ~ 1,
+    (logFC<-log2(1.25) & fdr<0.1) ~ 2,
+    TRUE ~ 3))]
+
+exon_ON <- filter(fread("../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Post-Splicing_Vglut1_CreON_RefvsAlt_LM_Annotated.tsv"),is.finite(fdr))%>%
+  .[,plotcolor := as.factor(case_when(
+    (logFC>log2(1.25) & fdr<0.1) ~ 1,
+    (logFC<-log2(1.25) & fdr<0.1) ~ 2,
+    TRUE ~ 3))]
+
+stability_ON <- filter(fread("../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Stability_Vglut1_CreON_RefvsAlt_LM_Annotated.tsv"),is.finite(fdr_interaction)) %>%
+  mutate(logFC_interaction = -(logFC_interaction)) %>%
+  .[,plotcolor := as.factor(case_when(
+    (logFC_interaction>log2(1.25) & fdr_interaction<0.1) ~ 1,
+    (logFC_interaction<-log2(1.25) & fdr_interaction<0.1) ~ 2,
+    TRUE ~ 3))]
+
+p1_OFF <- ggplot(intron_OFF)+
+  geom_point(aes(x=logFC,y=-log10(fdr),fill=plotcolor,shape=Pheno),size=2)+
+  scale_shape_manual(values=c(21,23))+
+  scale_fill_manual(values=c(cbPalette[1],cbPalette[1],"lightgrey"),
+                    labels=c("Increased Expression","Decreased Expression",
+                             "Not Significant"))+
+  geom_text_repel(data=filter(intron_OFF,Element %in% c("F2RL1_wgs","chr5:76327253;G|C;Family=11350"),fdr<0.1),
+                  aes(x=logFC,y=-log10(fdr),label=Symbol))+
+  labs(fill="Expression Change",
+       title="Variant vs. Reference Expression Change\nin Pre-Splicing Pool",
+       x="Log2 Fold Change in Expression",
+       y="-log10(FDR)")+
+  geom_vline(xintercept = -log2(1.25),linetype="dashed")+
+  geom_vline(xintercept = log2(1.25),linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1),linetype="dashed")
+print(p1_OFF)
+
+p2_OFF <- ggplot(exon_OFF)+
+  geom_point(aes(x=logFC,y=-log10(fdr),fill=plotcolor,shape=Pheno),size=2)+
+  scale_shape_manual(values=c(21,23))+
+  scale_fill_manual(values=c(cbPalette[1],cbPalette[1],"lightgrey"),
+                    labels=c("Increased Expression","Decreased Expression",
+                             "Not Significant"))+
+  geom_text_repel(data=filter(exon_OFF,Element %in% c("chr5:76327253;G|C;Family=11350","ZNF169_wgs"),fdr<0.1),
+                  aes(x=logFC,y=-log10(fdr),label=Symbol))+
+  labs(fill="Expression Change",
+       title="Variant vs. Reference Expression Change\nin Post-Splicing Pool",
+       x="Log2 Fold Change in Expression",
+       y="-log10(FDR)")+
+  geom_vline(xintercept = -log2(1.25),linetype="dashed")+
+  geom_vline(xintercept = log2(1.25),linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1),linetype="dashed")
+print(p2_OFF)
+
+p3_OFF <- ggplot(stability_OFF)+
+  geom_point(aes(x=logFC_interaction,y=-log10(fdr_interaction),fill=plotcolor,shape=Pheno),size=2)+
+  scale_shape_manual(values=c(21,23))+
+  scale_fill_manual(values=c(cbPalette[1],cbPalette[1],"lightgrey"),
+                    labels=c("Increased Stability","Decreased Stability",
+                             "Not Significant"))+
+  geom_text_repel(data=filter(stability_OFF,Element %in% c("chr7:151987279;C|T;Family=13556","chr16:70687915;C|T;Family=11168"),fdr_interaction<0.1),
+                  aes(x=logFC_interaction,y=-log10(fdr_interaction),label=Symbol))+
+  labs(fill="Stability Change",
+       title="Variant vs. Reference Stability Change",
+       x="Log2 Fold Change in Stability",
+       y="-log10(FDR)")+
+  geom_vline(xintercept = -log2(1.25),linetype="dashed")+
+  geom_vline(xintercept = log2(1.25),linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1),linetype="dashed")
+print(p3_OFF)
+
+export_graph_start("./Figures/Figure_6/RefvsAlt_All_CreOFF_fig6g-i.pdf",sideways=TRUE,height=0.5)
+print(p1_OFF+theme(legend.position = "none")+labs(title=NULL,subtitle="Pre-Splicing",x="Log2FC Expression")+
+        p2_OFF+theme(legend.position = "none")+labs(title=NULL,subtitle="Post-Splicing",x="Log2FC Expression")+
+        p3_OFF+theme(legend.position = "none")+labs(title=NULL,subtitle="Stability",x="Log2FC Stability")+
+        plot_layout(ncol=4)+plot_annotation(title="Reference vs. Variant"))
+export_graph_end()
+ ```
+
+###Figure 6J
+```{r figure_6j}
+exon_stability <- inner_join(
+  fread("../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Post-Splicing_Vglut1_CreOFF_RefvsAlt_LM.tsv"),
+  fread("../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Stability_Vglut1_CreOFF_RefvsAlt_LM.tsv"),
+  "Element")
+
+
+#Significant in both and same direction
+true_positives <- filter(exon_stability,
+                         fdr<0.1,
+                         fdr_interaction<0.1,
+                         ((logFC>0 & logFC_interaction>0) | (logFC & logFC_interaction<0))
+                         )$Element
+#Only significant in stability, not post-splicing
+false_negatives <- filter(exon_stability,
+                         fdr>0.1,
+                         fdr_interaction<0.1)$Element
+#Either only significant in post-splicing, or significant in both but opposite
+#directions
+false_positives <- c(
+  filter(exon_stability,
+         fdr<0.1,
+         fdr_interaction>0.1)$Element,
+  filter(exon_stability,
+         fdr<0.1,
+         fdr_interaction<0.1,
+         ((logFC>0 & logFC_interaction<0) | (logFC<0 & logFC_interaction>0)))$Element)
+  
+
+
+
+
+all_else <- filter(fread("../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Stability_Vglut1_CreOFF_RefvsAlt_LM.tsv"),
+                   !Element %in% false_positives,
+                   !Element %in% false_negatives,
+                   !Element %in% true_positives)$Element
+
+plottable <- rbind(
+  data.table("Element"=true_positives,"Category"="True Positive"),
+  data.table("Element"=false_positives,"Category"="False Positive"),
+  data.table("Element"=false_negatives,"Category"="False Negative"),
+  data.table("Element"=all_else,"Category"="Not Significant")
+)
+
+plottable[,Category := factor(Category,levels=c("True Positive","False Positive","False Negative","Not Significant"))]
+
+summary_data <- plottable %>%
+  group_by(Category) %>%
+  summarise(count = n()) %>%
+  mutate(percentage = count / sum(count) * 100)
+
+# Separate the data for labels
+label_data <- summary_data %>%
+  filter(Category != "Not Significant") %>%
+  mutate(cumulative_percentage = 100 - cumsum(percentage) + percentage/2)
+
+# Calculate the break point (adjust as needed)
+break_point <- max(label_data$percentage) * 2  # Double the largest small percentage
+
+# Create the plot
+
+p5 <- ggplot(summary_data, aes(x = "", y = percentage, fill = Category)) +
+  geom_col(width = 0.4, color = "black") +
+  geom_text(data = subset(summary_data, Category == "Not Significant"),
+            aes(label = paste0(round(percentage, 1), "%")),
+            position = position_stack(vjust = 0.95),
+            size = 5, fontface = "bold", color = "white") +
+  geom_label_repel(data = label_data,
+                   aes(label = paste0(Category, "\n", round(percentage, 3), "%"),
+                       y = cumulative_percentage),
+                   size = 3, direction = "y", hjust = 0, nudge_x = 0.6,
+                   force = 1, show.legend = FALSE,
+                   min.segment.length = 0) +
+  scale_fill_manual(values = c("Not Significant" = "lightgrey",
+                               "True Positive" = "#136d52",
+                               "False Positive" = "#21c494",
+                               "False Negative" = "#67e5bf")) +
+  labs(title = "Standard MPRA Accuracy",
+       y = "Percentage",
+       fill = "Category") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+        legend.position = "right",
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+export_graph_start("./Figures/Figure_6/RefAlt_Accuracy_CreOFF_fig6J.pdf",width=0.75)
+(p5+scale_y_break(c(break_point,85)))+theme_minimal()
+ggplot(summary_data,aes(Category,count,fill=as.factor(count)))+
+  geom_col()+
+  geom_text(aes(y=count-100,label=paste0(round(percentage,2),"\n",count)))+
+  theme(axis.text.x = element_text(angle = 45,hjust=1))
+export_graph_end()
+
+exon_stability <- left_join(exon_stability,plottable)
+exon_stability <- unique.data.frame(exon_stability)
+cortex_refalt_dotplot <- ggplot(exon_stability,aes(x=logFC,y=logFC_interaction,fill=Category))+
+  geom_point(shape=21,alpha=0.5,size=3)+
+  scale_fill_manual(values = c("Not Significant" = "lightgrey",
+                               "True Positive" = "#136d52",
+                               "False Positive" = "#21c494",
+                               "False Negative" = "#67e5bf"))+
+  labs(x="Log Fold Change\n(Post-Splice)",
+       y="Log Fold Change\n(Stability)",
+       )+
+  theme_bw()+
+  theme(legend.position = "none")
+print(cortex_refalt_dotplot)
+export_graph_start("./Figures/Figure_6/Cortex_RefAlt_PostvsStability_DotPlot_fig6J.pdf")
+print(cortex_refalt_dotplot + 
+        coord_fixed(ratio = 
+    diff(range(exon_stability$logFC[is.finite(exon_stability$logFC)])) / 
+    diff(range(exon_stability$logFC_interaction[is.finite(exon_stability$logFC_interaction)]))))
+export_graph_end()
+```
+
+###Figure 6K-M
+```{r figure6_k-m}
+
+p1_shuf_ON <- ggplot(filter(shufdata,Splicing_Pool=="Pre",Cre_Status=="Excitatory Neurons"))+
+  geom_point(aes(x=logFC,y=-log10(fdr),fill=plotcolor),shape=21,size=2)+
+  scale_fill_manual(values=c(cbPalette[1],cbPalette[1],"lightgrey"),
+                    labels=c("Increased Expression","Decreased Expression",
+                             "Not Significant"))+
+  labs(fill="Expression Change",
+       title="Variant vs. Reference Expression Change\nin Pre-Splicing Pool",
+       x="Log2 Fold Change in Expression",
+       y="-log10(FDR)")+
+  geom_vline(xintercept = log2(0.75),linetype="dashed")+
+  geom_vline(xintercept = log2(1.25),linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1),linetype="dashed")
+p1_shuf_ON
+
+p2_shuf_ON <- ggplot(filter(shufdata,Splicing_Pool=="Post",Cre_Status=="Excitatory Neurons"))+
+  geom_point(aes(x=logFC,y=-log10(fdr),fill=plotcolor),shape=21,size=2)+
+  scale_fill_manual(values=c(cbPalette[1],cbPalette[1],"lightgrey"),
+                    labels=c("Increased Expression","Decreased Expression",
+                             "Not Significant"))+
+  labs(fill="Expression Change",
+       title="Variant vs. Reference Expression Change\nin Pre-Splicing Pool",
+       x="Log2 Fold Change in Expression",
+       y="-log10(FDR)")+
+  geom_vline(xintercept = log2(0.75),linetype="dashed")+
+  geom_vline(xintercept = log2(1.25),linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1),linetype="dashed")
+p2_shuf_ON
+
+p3_shuf_ON <- ggplot(filter(shufdata,Splicing_Pool=="Stability",Cre_Status=="Excitatory Neurons"))+
+  geom_point(aes(x=logFC,y=-log10(fdr),fill=plotcolor),shape=21,size=2)+
+  scale_fill_manual(values=c(cbPalette[1],cbPalette[1],"lightgrey"),
+                    labels=c("Increased Expression","Decreased Expression",
+                             "Not Significant"))+
+  labs(fill="Expression Change",
+       title="Variant vs. Reference Expression Change\nin Pre-Splicing Pool",
+       x="Log2 Fold Change in Expression",
+       y="-log10(FDR)")+
+  geom_vline(xintercept = log2(0.75),linetype="dashed")+
+  geom_vline(xintercept = log2(1.25),linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1),linetype="dashed")
+p3_shuf_ON
+
+export_graph_start("./Figures/Figure_6/RefvsShuf_All_CreON_fig6k-m.pdf",sideways=TRUE,height=0.5)
+print(p1_shuf_ON+theme(legend.position = "none")+labs(title=NULL,subtitle="Pre-Splicing",x="Log2FC Expression")+
+        p2_shuf_ON+theme(legend.position = "none")+labs(title=NULL,subtitle="Post-Splicing",x="Log2FC Expression")+
+        p3_shuf_ON+theme(legend.position = "none")+labs(title=NULL,subtitle="Stability",x="Log2FC Stability")+
+        plot_layout(ncol=3)+plot_annotation(title="Reference vs. Shuffled"))
+export_graph_end()
+```
+
+###Figure 6N
+```{r figure_6N}
+exon_stability <- inner_join(
+  filter(shufdata,Splicing_Pool=="Post",Cre_Status=="Excitatory Neurons"),
+  filter(shufdata,Splicing_Pool=="Stability",Cre_Status=="Excitatory Neurons"),
+  "Element")
+
+
+#Significant in both and same direction
+true_positives <- filter(exon_stability,
+                         fdr.x<0.1,
+                         fdr.y<0.1,
+                         ((logFC.x>0 & logFC.y>0) | (logFC.x<0 & logFC.y<0))
+                         )$Element
+#Only significant in stability, not post-splicing
+false_negatives <- filter(exon_stability,
+                         fdr.x>0.1,
+                         fdr.y<0.1)$Element
+#Either only significant in post-splicing, or significant in both but opposite
+#directions
+false_positives <- c(
+  filter(exon_stability,
+         fdr.x<0.1,
+         fdr.y>0.1)$Element,
+  filter(exon_stability,
+         fdr.x<0.1,
+         fdr.y<0.1,
+         ((logFC.x>0 & logFC.y<0) | (logFC.x<0 & logFC.y>0)))$Element)
+  
+
+
+
+
+all_else <- filter(exon_stability,
+                   !Element %in% false_positives,
+                   !Element %in% false_negatives,
+                   !Element %in% true_positives)$Element
+
+plottable <- rbind(
+  data.table("Element"=true_positives,"Category"="True Positive"),
+  data.table("Element"=false_positives,"Category"="False Positive"),
+  data.table("Element"=false_negatives,"Category"="False Negative"),
+  data.table("Element"=all_else,"Category"="Not Significant")
+)
+
+plottable[,Category := factor(Category,levels=c("True Positive","False Positive","False Negative","Not Significant"))]
+
+summary_data <- plottable %>%
+  group_by(Category) %>%
+  summarise(count = n()) %>%
+  mutate(percentage = count / sum(count) * 100)
+
+# Separate the data for labels
+label_data <- summary_data %>%
+  filter(Category != "Not Significant") %>%
+  mutate(cumulative_percentage = 100 - cumsum(percentage) + percentage/2)
+
+# Create the plot
+
+p5_shuf <- ggplot(summary_data, aes(x = "", y = percentage, fill = Category)) +
+  geom_col(width = 0.4, color = "black") +
+  scale_fill_manual(values = c("Not Significant" = "lightgrey",
+                               "True Positive" = "#136d52",
+                               "False Positive" = "#21c494",
+                               "False Negative" = "#67e5bf")) +
+  labs(y = "Percentage",
+       fill = "Category",
+       x=NULL) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+        legend.position = "right",
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+export_graph_start("./Figures/Figure_6/RefShuf_Accuracy_CreON_fig6N.pdf",width=0.75)
+print(p5_shuf+theme_minimal())
+ggplot(summary_data,aes(Category,count,fill=as.factor(count)))+
+  geom_col()+
+  geom_text(aes(y=count-100,label=paste0(round(percentage,2),"\n",count)))+
+  theme(axis.text.x = element_text(angle = 45,hjust=1))
+export_graph_end()
+
+exon_stability <- left_join(exon_stability,plottable)
+exon_stability <- unique.data.frame(exon_stability)
+neuron_shuf_dotplot <- ggplot(exon_stability,aes(x=logFC.x,y=logFC.y,fill=Category))+
+  geom_point(shape=21,alpha=0.5,size=3)+
+  scale_fill_manual(values = c("Not Significant" = "lightgrey",
+                               "True Positive" = "#136d52",
+                               "False Positive" = "#21c494",
+                               "False Negative" = "#67e5bf"))+
+  labs(x="Log Fold Change\n(Post-Splice)",
+       y="Log Fold Change\n(Stability)",
+       )+
+  theme_bw()+
+  theme(legend.position = "none")
+print(neuron_shuf_dotplot)
+export_graph_start("./Figures/Figure_6/Neuron_RefShuf_PostvsStability_DotPlot_fig6N.pdf")
+print(neuron_shuf_dotplot + 
+        coord_fixed(ratio = 
+    diff(range(exon_stability$logFC.x[is.finite(exon_stability$logFC.x)])) / 
+    diff(range(exon_stability$logFC.y[is.finite(exon_stability$logFC.y)]))))
+export_graph_end()
+```
+
+###Figure 6O-Q
+
+```{r figure_6o-q}
+p1_ON <- ggplot(intron_ON)+
+  geom_point(aes(x=logFC,y=-log10(fdr),fill=plotcolor,shape=Pheno),size=2)+
+  scale_shape_manual(values=c(21,23))+
+  scale_fill_manual(values=c(cbPalette[1],cbPalette[1],"lightgrey"),
+                    labels=c("Increased Expression","Decreased Expression",
+                             "Not Significant"))+
+  geom_text_repel(data=filter(intron_ON,Element %in% c("chr5:76327253;G|C;Family=11350","MAST3_wgs"),fdr<0.1),
+                  aes(x=logFC,y=-log10(fdr),label=Symbol))+
+  labs(fill="Expression Change",
+       title="Variant vs. Reference Expression Change\nin Pre-Splicing Pool",
+       x="Log2 Fold Change in Expression",
+       y="-log10(FDR)")+
+  geom_vline(xintercept = log2(0.75),linetype="dashed")+
+  geom_vline(xintercept = log2(1.25),linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1),linetype="dashed")
+print(p1_ON)
+
+p2_ON <- ggplot(exon_ON)+
+  geom_point(aes(x=logFC,y=-log10(fdr),fill=plotcolor,shape=Pheno),size=2)+
+  scale_shape_manual(values=c(21,23))+
+  scale_fill_manual(values=c(cbPalette[1],cbPalette[1],"lightgrey"),
+                    labels=c("Increased Expression","Decreased Expression",
+                             "Not Significant"))+
+  geom_text_repel(data=filter(exon_ON,Element %in% c("chr5:76327253;G|C;Family=11350","ZNF169_wgs"),fdr<0.1),
+                  aes(x=logFC,y=-log10(fdr),label=Symbol))+
+  labs(fill="Expression Change",
+       title="Variant vs. Reference Expression Change\nin Post-Splicing Pool",
+       x="Log2 Fold Change in Expression",
+       y="-log10(FDR)")+
+  geom_vline(xintercept = log2(0.75),linetype="dashed")+
+  geom_vline(xintercept = log2(1.25),linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1),linetype="dashed")
+print(p2_ON)
+
+p3_ON <- ggplot(stability_ON)+
+  geom_point(aes(x=logFC_interaction,y=-log10(fdr_interaction),fill=plotcolor,shape=Pheno),size=2)+
+  scale_shape_manual(values=c(21,23))+
+  scale_fill_manual(values=c(cbPalette[1],cbPalette[1],"lightgrey"),
+                    labels=c("Increased Stability","Decreased Stability",
+                             "Not Significant"))+
+  geom_text_repel(data=filter(stability_ON,Element %in% c("chr10:50306955;T|C;Family=13928","chr4:95156901;A|G;Family=11368"),fdr_interaction<0.1),
+                  aes(x=logFC_interaction,y=-log10(fdr_interaction),label=Symbol))+
+  labs(fill="Stability Change",
+       title="Variant vs. Reference Stability Change",
+       x="Log2 Fold Change in Stability",
+       y="-log10(FDR)")+
+  geom_vline(xintercept = log2(0.75),linetype="dashed")+
+  geom_vline(xintercept = log2(1.25),linetype="dashed")+
+  geom_hline(yintercept = -log10(0.1),linetype="dashed")
+print(p3_ON)
+
+export_graph_start("./Figures/Figure_6/RefvsAlt_All_CreON_fig_6o-q.pdf",sideways=TRUE,height=0.5)
+print(p1_ON+theme(legend.position = "none")+labs(title=NULL,subtitle="Pre-Splicing",x="Log2FC Expression")+
+        p2_ON+theme(legend.position = "none")+labs(title=NULL,subtitle="Post-Splicing",x="Log2FC Expression")+
+        p3_ON+theme(legend.position = "none")+labs(title=NULL,subtitle="Stability",x="Log2FC Stability")+
+        plot_layout(ncol=4)+plot_annotation(title="Reference vs. Variant"))
+export_graph_end()
+```
+
+###Figure 6R
+```{r figure_6R}
+
+exon_stability <- inner_join(
+  fread("../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Post-Splicing_Vglut1_CreON_RefvsAlt_LM.tsv"),
+  fread("../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Stability_Vglut1_CreON_RefvsAlt_LM.tsv"),
+  "Element")
+
+
+#Significant in both and same direction
+true_positives <- filter(exon_stability,
+                         fdr<0.1,
+                         fdr_interaction<0.1,
+                         ((logFC>0 & logFC_interaction>0) | (logFC & logFC_interaction<0))
+                         )$Element
+#Only significant in stability, not post-splicing
+false_negatives <- filter(exon_stability,
+                         fdr>0.1,
+                         fdr_interaction<0.1)$Element
+#Either only significant in post-splicing, or significant in both but opposite
+#directions
+false_positives <- c(
+  filter(exon_stability,
+         fdr<0.1,
+         fdr_interaction>0.1)$Element,
+  filter(exon_stability,
+         fdr<0.1,
+         fdr_interaction<0.1,
+         ((logFC>0 & logFC_interaction<0) | (logFC<0 & logFC_interaction>0)))$Element)
+  
+
+
+
+
+all_else <- filter(fread("../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Stability_Vglut1_CreON_RefvsAlt_LM.tsv"),
+                   !Element %in% false_positives,
+                   !Element %in% false_negatives,
+                   !Element %in% true_positives)$Element
+
+plottable <- rbind(
+  data.table("Element"=true_positives,"Category"="True Positive"),
+  data.table("Element"=false_positives,"Category"="False Positive"),
+  data.table("Element"=false_negatives,"Category"="False Negative"),
+  data.table("Element"=all_else,"Category"="Not Significant")
+)
+
+plottable[,Category := factor(Category,levels=c("True Positive","False Positive","False Negative","Not Significant"))]
+
+summary_data <- plottable %>%
+  group_by(Category) %>%
+  summarise(count = n()) %>%
+  mutate(percentage = count / sum(count) * 100)
+
+# Separate the data for labels
+label_data <- summary_data %>%
+  filter(Category != "Not Significant") %>%
+  mutate(cumulative_percentage = 100 - cumsum(percentage) + percentage/2)
+
+# Calculate the break point (adjust as needed)
+break_point <- max(label_data$percentage) * 2  # Double the largest small percentage
+
+# Create the plot
+
+p5 <- ggplot(summary_data, aes(x = "", y = percentage, fill = Category)) +
+  geom_col(width = 0.4, color = "black") +
+  geom_text(data = subset(summary_data, Category == "Not Significant"),
+            aes(label = paste0(round(percentage, 1), "%")),
+            position = position_stack(vjust = 0.95),
+            size = 5, fontface = "bold", color = "white") +
+  geom_label_repel(data = label_data,
+                   aes(label = paste0(Category, "\n", round(percentage, 3), "%"),
+                       y = cumulative_percentage),
+                   size = 3, direction = "y", hjust = 0, nudge_x = 0.6,
+                   force = 1, show.legend = FALSE,
+                   min.segment.length = 0) +
+  scale_fill_manual(values = c("Not Significant" = "lightgrey",
+                               "True Positive" = "#136d52",
+                               "False Positive" = "#21c494",
+                               "False Negative" = "#67e5bf")) +
+  labs(title = "Standard MPRA Accuracy",
+       y = "Percentage",
+       fill = "Category") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+        legend.position = "right",
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+export_graph_start("./Figures/Figure_6/RefAlt_Accuracy_CreON_fig6r.pdf",width=0.75)
+(p5+scale_y_break(c(break_point,95)))+theme_minimal()
+ggplot(summary_data,aes(Category,count,fill=as.factor(count)))+
+  geom_col()+
+  geom_text(aes(y=count-100,label=paste0(round(percentage,2),"\n",count)))+
+  theme(axis.text.x = element_text(angle = 45,hjust=1))
+export_graph_end()
+
+#New 17Jul2025, make a dotplot
+
+exon_stability <- left_join(exon_stability,plottable)
+exon_stability <- unique.data.frame(exon_stability)
+neuron_refalt_dotplot <- ggplot(exon_stability,aes(x=logFC,y=logFC_interaction,fill=Category))+
+  geom_point(shape=21,alpha=0.5,size=3)+
+  scale_fill_manual(values = c("Not Significant" = "lightgrey",
+                               "True Positive" = "#136d52",
+                               "False Positive" = "#21c494",
+                               "False Negative" = "#67e5bf"))+
+  labs(x="Log Fold Change\n(Post-Splice)",
+       y="Log Fold Change\n(Stability)",
+       )+
+  theme_bw()+
+  theme(legend.position = "none")
+print(neuron_refalt_dotplot)
+export_graph_start("./Figures/Figure_6//Neuron_RefAlt_PostvsStability_DotPlot_fig6R.pdf")
+print(neuron_refalt_dotplot + 
+        coord_fixed(ratio = 
+    diff(range(exon_stability$logFC[is.finite(exon_stability$logFC)])) / 
+    diff(range(exon_stability$logFC_interaction[is.finite(exon_stability$logFC_interaction)]))))
+export_graph_end()
+
+
+```
+
+##Table S3 - 3'UTR Variants
+```{r TableS3_3UTRvariants}
+fwrite(fread("../code/mpra_tools/fullannotationtable.txt"),"./Tables/Table_S3.txt")
+```
+
+##Table S6 - In Cellulo Significance Results
+```{r tableS6_singificance_results}
+
+# 1. Define file paths and matching Excel sheet names (Strictly <= 31 chars)
+file_info <- data.frame(
+  filename = c("../analysis/Library1and2BCLess_ISOMPRA_6-30-2022/Pre-Splicing_RefvsShuf_Welchs.tsv",
+               "../analysis/Library1and2BCLess_ISOMPRA_6-30-2022/Pre-Splicing_RefvsAlt_LM_Annotated.tsv",
+               "../analysis/Library1and2BCLess_ISOMPRA_6-30-2022/Post-Splicing_RefvsShuf_Welchs.tsv",
+               "../analysis/Library1and2BCLess_ISOMPRA_6-30-2022/Post-Splicing_RefvsAlt_LM_Annotated.tsv",
+               "../analysis/Library1and2BCLess_ISOMPRA_6-30-2022/Stability_RefvsShuf_Welchs.tsv",
+               "../analysis/Library1and2BCLess_ISOMPRA_6-30-2022/Stability_RefvsAlt_LM_Annotated.tsv",
+               "../analysis/Library1and2BCLess_ISOMPRA_6-30-2022/Translation_Splicing-Agnostic_RefvsShuf_Welchs.tsv",
+               "../analysis/Library1and2BCLess_ISOMPRA_6-30-2022/Translation_Splicing-Agnostic_RefvsAlt_LM_Annotated.tsv",
+               "../analysis/ActD Trials/Full_Library_08Apr2026/Pre-Splicing_RefvsShuf_Welchs.tsv",
+               "../analysis/ActD Trials/Full_Library_08Apr2026/PreSplicing_RefAlt_LM.txt",
+               "../analysis/ActD Trials/Full_Library_08Apr2026/Post-Splicing_RefvsShuf_Welchs.tsv",
+               "../analysis/ActD Trials/Full_Library_08Apr2026/PostSplicing_RefAlt_LM.txt",
+               "../analysis/ActD Trials/Full_Library_08Apr2026/Stability_RefvsShuf_Welchs.tsv",
+               "../analysis/ActD Trials/Full_Library_08Apr2026/Stability_RefAlt_LM.txt",
+               "../analysis/ActD Trials/Full_Library_08Apr2026/ActD_Zero-to-Five_RefvsAlt_LM.tsv",
+               "../analysis/ActD Trials/Full_Library_08Apr2026/ActD_Zero-to-Eleven_RefvsAlt_LM.tsv"),
+  sheetname = c("Pre-Splicing RefvsShuf TRAP",
+                "Pre-Splicing RefvsAlt TRAP",
+                "Post-Splicing RefvsShuf TRAP",
+                "Post-Splicing RefvsAlt TRAP",
+                "Stability RefvsShuf TRAP",
+                "Stability RefvsAlt TRAP",
+                "Translation RefvsShuf TRAP",
+                "Translation RevvsAlt TRAP",
+                "Pre-Splicing RefvsShuf ActD",
+                "Pre-Splicing RefvsAlt ActD",
+                "Post-Splicing RefvsShuf ActD",
+                "Post-Splicing RefvsAlt ActD",
+                "Stability RefvsShuf ActD",
+                "Stability RefvsAlt ActD",
+                "ActD t0 vs. t5 Allelic Ratio",   # Shortened to 31 chars
+                "ActD t0 vs t11 Allelic Ratio"),  # Shortened to 31 chars
+  stringsAsFactors = FALSE
+)
+
+# 2. Define data for the new summary landing page metadata matrix
+summary_data <- data.frame(
+  SheetName = file_info$sheetname,
+  Description = c(
+    "HEK233 Cell Element Effects in Pre-Splicing Pool from TRAP Experiment",
+    "HEK233 Cell Variant Effects in Pre-Splicing Pool from TRAP Experiment",
+    "HEK233 Cell Element Effects in Post-Splicing Pool from TRAP Experiment",
+    "HEK233 Cell Variant Effects in Post-Splicing Pool from TRAP Experiment",
+    "HEK233 Cell Element Effects on Stability from TRAP Experiment",
+    "HEK233 Cell Variant Effects on Stability from TRAP Experiment",
+    "HEK233 Cell Element Effects on Translational Efficiency from TRAP Experiment",
+    "HEK233 Cell Variant Effects on Translational Efficiency from TRAP Experiment",
+    "HEK233 Cell Element Effects in Pre-Splicing Pool from Actinomycin D Assay",
+    "HEK233 Cell Variant Effects in Pre-Splicing Pool from Actinomycin D Assay",
+    "HEK233 Cell Element Effects in Post-Splicing Pool from Actinomycin D Assay",
+    "HEK233 Cell Variant Effects in Post-Splicing Pool from Actinomycin D Assay",
+    "HEK233 Cell Element Effects on Stability from Actinomycin D Assay Time Zero",
+    "HEK233 Cell Variant Effects on Stability from Actinomycin D Assay Time Zero",
+    "HEK233 Cell Variant Effects on Allelic Ratio (Variant/WT) from Actinomycin D Assay Time Zero vs. Time Five Hours",
+    "HEK233 Cell Variant Effects on Allelic Ratio (Variant/WT) from Actinomycin D Assay Time Zero vs. Time Eleven Hours"
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Create a new Excel workbook
+workbook <- createWorkbook()
+
+# 3. Create and Write the Summary landing sheet at position 1
+addWorksheet(workbook, "Summary")
+
+# Write the Table header layout metadata block
+writeData(workbook, "Summary", x = "Table S6. HEK293 In Cellulo uISOMPRA Results.", startCol = 1, startRow = 1)
+addStyle(workbook, "Summary", style = createStyle(textDecoration = "bold"), rows = 1, cols = 1)
+
+# Write the index dataframe underneath it (row 3, without column names to match image format layout)
+writeData(workbook, "Summary", x = summary_data, startCol = 1, startRow = 3, colNames = FALSE)
+
+# 4. Loop through and populate each individual experimental data sheet
+for (i in 1:nrow(file_info)) {
+  # Read individual source data sets
+  data <- fread(file_info$filename[i])
+  
+  # Append data worksheets sequentially after the summary page
+  addWorksheet(workbook, file_info$sheetname[i])
+  writeData(workbook, file_info$sheetname[i], data)
+}
+
+# 5. Automatically adjust column widths across all sheets for a clean fit
+for (sheet in names(workbook)) {
+  setColWidths(workbook, sheet, cols = 1:ncol(summary_data), widths = "auto")
+}
+
+# Save the workbook file artifact downstream
+saveWorkbook(workbook, "./Tables/Table_S6.xlsx", overwrite = TRUE)
+```
+
+##Table S8 - In Vivo Significance Results
+```{r tableS8_invivo_signficance_results}
+
+# 1. Define file paths and matching Excel sheet names (Strictly <= 31 chars)
+file_info <- data.frame(
+  filename = c("../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Pre-Splicing_Vglut1_CreOFF_RefvsShuf_Welchs_Annotated.tsv",
+               "../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Pre-Splicing_Vglut1_CreOFF_RefvsAlt_LM_Annotated.tsv",
+               "../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Pre-Splicing_Vglut1_CreON_RefvsShuf_Welchs_Annotated.tsv",
+               "../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Pre-Splicing_Vglut1_CreON_RefvsAlt_LM_Annotated.tsv",
+               "../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Post-Splicing_Vglut1_CreOFF_RefvsShuf_Welchs_Annotated.tsv",
+               "../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Post-Splicing_Vglut1_CreOFF_RefvsAlt_LM_Annotated.tsv",
+               "../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Post-Splicing_Vglut1_CreON_RefvsShuf_Welchs_Annotated.tsv",
+               "../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Post-Splicing_Vglut1_CreON_RefvsAlt_LM_Annotated.tsv",
+               "../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Stability_Vglut1_CreOFF_RefvsShuf_Welchs_Annotated.tsv",
+               "../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Stability_Vglut1_CreOFF_RefvsAlt_LM_Annotated.tsv",
+               "../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Stability_Vglut1_CreON_RefvsShuf_Welchs_Annotated.tsv",
+               "../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Stability_Vglut1_CreON_RefvsAlt_LM_Annotated.tsv"),
+  sheetname = c("Pre-Splicing Cortex RefvsShuf",
+                "Pre-Splicing Cortex RefvsAlt",
+                "Pre-Splicing ExN RefvsShuf",
+                "Pre-Splicing ExN RefvsAlt",
+                "Post-Splicing Cortex RefvsShuf", # Shortened to 30 chars
+                "Post-Splicing Cortex RefvsAlt",
+                "Post-Splicing ExN RefvsShuf",
+                "Post-Splicing ExN RefvsAlt",
+                "Stability Cortex RefvsShuf",
+                "Stability Cortex RefvsAlt",
+                "Stability ExN RefvsShuf",
+                "Stability ExN RefvsAlt"),
+  stringsAsFactors = FALSE
+)
+
+# 2. Define data for the Summary landing page text
+summary_data <- data.frame(
+  SheetName = file_info$sheetname,
+  Description = c(
+    "Whole Cortex Element Effects in Pre-Splicing Pool",
+    "Whole Cortex Variant Effects in Pre-Splicing Pool",
+    "Excitatory Neuron Element Effects in Pre-Splicing Pool",
+    "Excitatory Neuron Variant Effects in Pre-Splicing Pool",
+    "Whole Cortex Element Effects in Post-Splicing Pool",
+    "Whole Cortex Variant Effects in Post-Splicing Pool",
+    "Excitatory Neuron Element Effects in Post-Splicing Pool",
+    "Excitatory Neuron Variant Effects in Post-Splicing Pool",
+    "Whole Cortex Element Effects on Stability",
+    "Whole Cortex Variant Effects on Stability",
+    "Excitatory Neuron Element Effects on Stability",
+    "Excitatory Neuron Variant Effects on Stability"
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Create a new Excel workbook
+workbook <- createWorkbook()
+
+# 3. Create and Write the Summary landing sheet at position 1
+addWorksheet(workbook, "Summary")
+
+# Write the title block at row 1, column 1
+writeData(workbook, "Summary", x = "Table S8. uISOMPRA In Vivo Results", startCol = 1, startRow = 1)
+addStyle(workbook, "Summary", style = createStyle(textDecoration = "bold"), rows = 1, cols = 1)
+
+# Write the summary index block below it (starting at row 3) without headers
+writeData(workbook, "Summary", x = summary_data, startCol = 1, startRow = 3, colNames = FALSE)
+
+# Set clean sizing for the Summary tab columns so descriptions look perfect
+setColWidths(workbook, "Summary", cols = 1, widths = 35)
+setColWidths(workbook, "Summary", cols = 2, widths = 65)
+
+# 4. Loop through and populate each individual experimental data sheet
+for (i in 1:nrow(file_info)) {
+  data <- fread(file_info$filename[i])
+  
+  addWorksheet(workbook, file_info$sheetname[i])
+  writeData(workbook, file_info$sheetname[i], data)
+  
+  # Automatically adjust data sheet columns so formatting is clean
+  setColWidths(workbook, file_info$sheetname[i], cols = 1:ncol(data), widths = "auto")
+}
+
+# 5. Save the final openxlsx object to the required folder path
+saveWorkbook(workbook, "./Tables/Table_S8.xlsx", overwrite = TRUE)
+```
+
+##Table S9 - In Vivo Stability:Sex Effects
+```{r tableS9_invivo_stability_sex_effects}
+#And separately an xlsx for the Allele:SpliceStatus:Sex, just two workbooks
+file_info <- data.frame(
+  filename = c("../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Stability_Vglut1_CreOFF_AllelevsSplicevsSex_LM_Annotated.tsv",
+               "../analysis/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Stability_Vglut1_CreON_AllelevsSplicevsSex_LM_Annotated.tsv"),
+  sheetname = c("Cortex AllelevsSplicevsSex",
+                "ExN AllelevsSplicevsSex"), # Ensure names are ≤ 31 characters
+  stringsAsFactors = FALSE
+)
+
+# 2. Define data for the Summary landing page text
+summary_data <- data.frame(
+  SheetName = file_info$sheetname,
+  Description = c(
+    "uISOMPRA Allele*SpliceStatus*Sex Significance Testing in Whole Cortex
+",
+    "uISOMPRA Allele*SpliceStatus*Sex Significance Testing in Excitatory Neurons
+"),
+  stringsAsFactors = FALSE
+)
+
+# Create a new Excel workbook
+workbook <- createWorkbook()
+
+# 3. Create and Write the Summary landing sheet at position 1
+addWorksheet(workbook, "Summary")
+
+# Write the title block at row 1, column 1
+writeData(workbook, "Summary", x = "Table S9. uISOMPRA In Vivo Sex Effects
+", startCol = 1, startRow = 1)
+addStyle(workbook, "Summary", style = createStyle(textDecoration = "bold"), rows = 1, cols = 1)
+
+# Write the summary index block below it (starting at row 3) without headers
+writeData(workbook, "Summary", x = summary_data, startCol = 1, startRow = 3, colNames = FALSE)
+
+# Set clean sizing for the Summary tab columns so descriptions look perfect
+setColWidths(workbook, "Summary", cols = 1, widths = 35)
+setColWidths(workbook, "Summary", cols = 2, widths = 65)
+
+# 4. Loop through and populate each individual experimental data sheet
+for (i in 1:nrow(file_info)) {
+  data <- fread(file_info$filename[i])
+  
+  addWorksheet(workbook, file_info$sheetname[i])
+  writeData(workbook, file_info$sheetname[i], data)
+  
+  # Automatically adjust data sheet columns so formatting is clean
+  setColWidths(workbook, file_info$sheetname[i], cols = 1:ncol(data), widths = "auto")
+}
+
+# 5. Save the final openxlsx object to the required folder path
+saveWorkbook(workbook, "./Tables/Table_S9.xlsx", overwrite = TRUE)
+```
+
+
+```{r}
+#From latest talk before end of 2024, make a chart with the Allele:Sex sigs from
+#the above two data tables, boxplots with lines, following the code from earlier
+#to make the boxplot data table, only cre-off yielded something
+
+d_off <- fread("../Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Stability_Vglut1_CreON_AllelevsSplicevsSex_LM_Annotated.tsv")
+d_on <- fread("../Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Stability_Vglut1_CreOFF_AllelevsSplicevsSex_LM_Annotated.tsv")
+d <- fread("../Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/Vglut1-Cre Expression Table.csv")
+#give the data a symbol (gene name) for plotting
+d <- left_join(d,select(fread("../../code/mpra_tools/fullannotationtable.txt"),c("Element","Symbol")))
+
+make_sex_lineplot <- function(data){
+  elements <- unique(data$Element)
+  plots <- lapply(elements,function(element) {
+   sub_data <- filter(data,Element==element,(Allele=="ref" | Allele=="alt"))
+   sub_data$Allele <- factor(sub_data$Allele,levels = c("ref","alt"),labels = c("Reference","Variant"))
+   sub_data$Splicing_Pool <- factor(sub_data$Splicing_Pool,levels = c("Pre","Post"))
+   sub_data$Sex <- factor(sub_data$Sex,levels = c("m","f"),labels = c("Male","Female"))
+   genetitle <- sub_data$Symbol
+    ggplot(filter(sub_data,Element==element),aes(x=Sex,y=Expression,fill=Splicing_Pool,group=interaction(Splicing_Pool,Sex)))+
+    geom_boxplot(color="black",outliers = TRUE,position = position_dodge(width = 0),linewidth=0.1)+
+    geom_point(shape=21,color="black",position = position_dodge(width = 0))+
+      stat_smooth(method="lm",aes(group=Splicing_Pool,color=Splicing_Pool),show.legend = FALSE,linewidth=0.25)+
+      labs(title=unique(sub_data$Symbol))+
+      scale_fill_manual(values=c("#136d52","#67e5bf"))+
+      scale_color_manual(values=c("#136d52","#67e5bf"))
+  })
+  return(plots)
+}
+
+export_graph_start("VGlut1_CreOFF_SplicingPoolvsSex.pdf")  
+make_sex_lineplot(filter(d,Cre_Status=="OFF",
+                         Element %in% filter(
+                           d_off,`fdr_Splicing_Pool:Sex`<0.1)$Element
+                         ))
+export_graph_end()
+```
+
+```{r}
+#Data from the TRAP in vivo, looking at Allele*Sex interaction
+#No Ref vs alt sigs from whole cortex, but some from ExN
+refalt_on <- fread("../Library1and2BCLess_ISOMPRA_In_Vivo_6-1-2023/Translation_RefvsAlt_CreON_LM_Annotated.tsv")
+allelesex_off <- fread("../Library1and2BCLess_ISOMPRA_In_Vivo_6-1-2023/Translation_AllelevsSex_CreOFF_LM_Annotated.tsv")
+allelesex_on <- fread("../Library1and2BCLess_ISOMPRA_In_Vivo_6-1-2023/Translation_AllelevsSex_CreON_LM_Annotated.tsv")
+d_te_off <- fread("../Library1and2BCLess_ISOMPRA_In_Vivo_6-1-2023/Cre-OFF_Translation_Values.tsv")
+d_te_on <- fread("../Library1and2BCLess_ISOMPRA_In_Vivo_6-1-2023/Cre-ON_Translation_Values.tsv")
+
+d_te_off <- left_join(d_te_off,select(fread("../../code/mpra_tools/fullannotationtable.txt"),c("Element","Symbol")))
+
+make_te_sex_lineplot <- function(data){
+  elements <- unique(data$Element)
+  plots <- lapply(elements,function(element) {
+   sub_data <- filter(data,Element==element,(Allele=="ref" | Allele=="alt"))
+   sub_data$Allele <- factor(sub_data$Allele,levels = c("ref","alt"),labels = c("Reference","Variant"))
+   sub_data$Sex <- factor(sub_data$Sex,levels = c("m","f"),labels = c("Male","Female"))
+   genetitle <- sub_data$Symbol
+    ggplot(filter(sub_data,Element==element),aes(x=Sex,y=Expression,fill=Allele,group=interaction(Sex,Allele)))+
+    geom_boxplot(color="black",outliers = TRUE,position = position_dodge(width = 0),linewidth=0.1)+
+    geom_point(shape=21,color="black",position = position_dodge(width = 0))+
+      stat_smooth(method="lm",aes(group=Allele,color=Allele),show.legend = FALSE,linewidth=0.25)+
+      labs(title=unique(sub_data$Symbol),y="Translational Efficiency")+
+      scale_fill_manual(values=c("#136d52","#67e5bf"))+
+      scale_color_manual(values=c("#136d52","#67e5bf"))
+  })
+  return(plots)
+}
+
+export_graph_start("Whole_Cortex_SexMainEffect_Lineplots.pdf")
+#Get a list of the top values from Cre-OFF
+sigs <- filter(allelesex_off,fdr_secondterm<0.1)
+setorderv(sigs,c("fdr_secondterm","logFC_secondterm"))
+make_te_sex_lineplot(filter(d_te_off,Element %in% unique(sigs$Element)))
+export_graph_end()
+
+#Clean up
+rm(list = setdiff(ls(), lsf.str()))
+```
+
+
+##Figure S2
+```{r New Supplemental Figures 09Apr2025}
+badAlt<-c('ZNF626_wgs','ASIC2_wgs', 'CDKN2B_wgs', 'ELMO1_wgs', 'ENPP5_wgs', 'GDPD4_ssc', 'INSR_wgs', 'LMBRD2_wgs', 'LRP2BP_wgs', 'SCARB2.1_wgs', 'TLK1_wgs', 'TRIM37_wgs', 'ZCCHC11_wgs')
+GC_table <- fread("../data/formatted/ActD_Trials_08Apr2026/formatted.txt") %>% 
+  filter(,!Element %in% badAlt,Fraction=="0hr",grepl("_ref$",Element)) %>%
+  mutate(CPM = CPM + 1) %>% #Add a pseudocount
+  pivot_wider(names_from = "Splicing",id_cols = c("Element","BiolRep"), values_from = "CPM") %>%
+  mutate(Stability = log2(post)-log2(pre)) %>% group_by(Element) %>%
+  summarize(Mean_Exon_Intron = mean(Stability)) %>% filter(is.finite(Mean_Exon_Intron))
+#The reviewers asked for sequence features, so we're going to give them post-
+#pre-splicing vs GC content, which is anticorrelated with free folding energy
+#(makes sense that it would be)
+free_folding <- readLines("../code/mpra_tools/freefolding.txt")
+free_folding <- data.table("Element" = free_folding[seq(1,24291,3)],
+                           "Sequence" = free_folding[seq(2,24291,3)],
+                           "Energy" = free_folding[seq(3,24291,3)])
+free_folding$Element <- str_replace_all(free_folding$Element,"^>","")
+free_folding[, DeltaG := as.numeric(str_extract(Energy, "-?\\d+\\.\\d+"))]
+free_folding <- free_folding[,c(1,2,4)]
+free_folding <- free_folding %>%
+  mutate(
+    # Count G and C case-insensitively, then divide by total length
+    GC_content = (str_count(Sequence, "(?i)[GC]") / str_length(Sequence))*100
+  )
+GC_table <- right_join(free_folding,GC_table)
+
+
+export_graph_start("./Figures/Figure_S2/GC Content and Free Energy vs Stability Correlation_figS2c-d.pdf")
+ggplot(GC_table,aes(x=GC_content,y=Mean_Exon_Intron))+
+  geom_pointdensity()+
+  stat_smooth(method = "lm",color="black",linewidth=1)+
+  labs(
+    x="Element GC Content %",
+    y="Stability (Post- Minus Pre-Splicing Expression",
+    title="GC Content vs. Stability Correlation")+
+  geom_text(aes(x=30,
+                y=2.5,
+                label = paste0(
+                  "Spearman's Rho: ",
+                  round(
+                    cor.test(GC_table$GC_content,
+                             GC_table$Mean_Exon_Intron,
+                             method="spearman")$estimate,2),
+                  "****"
+                  )))+
+  scale_color_viridis_c()+
+  theme(legend.position = "none")
+
+ggplot(GC_table,aes(x=DeltaG,y=Mean_Exon_Intron))+
+  geom_pointdensity()+
+  stat_smooth(method = "lm",color="black",linewidth=1)+
+  labs(
+    x=expression("Minimum Free Energy (MFE) ("*Delta*"G, kcal/mol)"),
+    y="Stability (Post- Minus Pre-Splicing Expression",
+    title=expression("Minimum Free Energy (MFE, "*Delta*"G) vs. Stability Correlation"))+
+  geom_text(aes(x=-65,
+                y=2.5,
+                label = paste0(
+                  "Spearman's Rho: ",
+                  round(
+                    cor.test(GC_table$DeltaG,
+                             GC_table$Mean_Exon_Intron,
+                             method="spearman")$estimate,2),
+                  "****"
+                  )))+
+  scale_color_viridis_c()+
+  theme(legend.position = "none")
+export_graph_end()
+
+
+
+ 
+#New Raincloud plot for stability sequences
+d <- fread("../../data/formatted/Library1and2BCLess_ISOMPRA_6-30-2022/formatted_Reads_compiled_06-30-2022.tsv") %>% filter(,!Element %in% badAlt)
+d <- left_join(filter(d,Comment=="Input Intronic (pre) mRNA"),filter(d,Comment=="Input Exonic (mature) mRNA"),by=c("Element","Allele","BiolRep")) %>% mutate(Stability=log2(CPM.y)-log2(CPM.x))
+
+
+p2 <- ggplot(
+  rbind(
+    filter(d,Allele=="dnvctl",Element!="QREx4",is.finite(Stability)),
+    filter(d,Allele=="shuf",is.finite(Stability))%>%mutate(Element="Shuffled Elements"))
+  %>%mutate(Element=factor(Element,levels=c("Shuffled Elements","PREx4","SREx4","WPRE-alpha"),labels=c("Shuffled Elements","Pumilio Response Element","Smaug Response Element","Woodchuck HV Posttranscriptional Response Element"))),
+    aes(x=Element,y=Stability,fill=Element))+
+  geom_rain(point.args = list(shape=21, alpha = 0.2),
+            violin.args.pos = list(scale="width",width=1.5,position=position_nudge(x=0.15)),
+            rain.side = "r")+
+  geom_signif(comparisons = list(
+    c("Pumilio Response Element","Shuffled Elements"),
+    c("Smaug Response Element","Shuffled Elements"),
+    c("Woodchuck HV Posttranscriptional Response Element","Shuffled Elements")),map_signif_level = TRUE,test = "t.test",y_position = c(1.5,1.8,2.1),tip_length = 0)+
+  labs(title="Stability of Control Sequences",y="Stability\n(Post-Splicing Expression\nMinus Pre-Splicing Expression)")+
+  theme(plot.title = element_text(hjust=0.5),
+        legend.position = "none",
+        axis.title.x = element_blank())+
+  scale_y_continuous(limits = c(-2.5,2.7))+
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 13))+
+  scale_fill_manual(values=c("#454545","#808080","#bababa","#f5f5f5"))
+print(p2)
+
+p2 <- ggplot(
+  rbind(
+    filter(d,Allele=="dnvctl",Element!="QREx4",is.finite(Stability)),
+    filter(d,Allele=="shuf",is.finite(Stability))%>%mutate(Element="Shuffled Elements"))
+  %>%mutate(Element=factor(Element,levels=c("Shuffled Elements","PREx4","SREx4","WPRE-alpha"),labels=c("Shuffled","PRE","SRE","WPRE"))),
+    aes(x=Element,y=Stability,fill=Element))+
+  geom_rain(point.args = list(shape=21, alpha = 0.2))+
+  geom_signif(comparisons = list(
+    c("PRE","Shuffled"),
+    c("SRE","Shuffled"),
+    c("WPRE","Shuffled")),map_signif_level = TRUE,test = "t.test",y_position = c(1.5,1.8,2.1),tip_length = 0)+
+  labs(title="Stability of Control Sequences",y="Stability\n(Post-Splicing Expression\nMinus Pre-Splicing Expression)")+
+  theme(plot.title = element_text(hjust=0.5),legend.position = "none")+
+  scale_y_continuous(limits = c(-2.5,2.7))+
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 13))+
+  scale_fill_manual(values=c("#454545","#808080","#bababa","#f5f5f5"))
+
+print(p2)
+
+export_graph_start("./Figures/Figure1/Control Stability - RainCloud.pdf")
+print(p2+coord_fixed(ratio=0.45))
+export_graph_end()
+
+
+```
+

@@ -1,0 +1,964 @@
+---
+title: "Variant Analysis of In Vivo ISOMPRA No TRAP"
+author: "Anthony Fischer"
+date: "2023-03-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+sessionInfo()
+```
+
+## Load Tools
+```{r load_tools, include=FALSE}
+source("../../code/mpra_tools/mpra_tools.R")
+library(umap)
+library(RColorBrewer)
+library(ggforce)
+library(fplot)
+library(pdftools)
+library(ggrepel)
+cbPalette <- brewer.pal(8,"Dark2")
+#A list of elements we do not consider from Library 1.0 as they have bad variant sequences
+badAlt<-c('ZNF626_wgs','ASIC2_wgs', 'CDKN2B_wgs', 'ELMO1_wgs', 'ENPP5_wgs', 'GDPD4_ssc', 'INSR_wgs', 'LMBRD2_wgs', 'LRP2BP_wgs', 'SCARB2.1_wgs', 'TLK1_wgs', 'TRIM37_wgs', 'ZCCHC11_wgs')
+#Set the theme for all ggplots
+theme_set(
+  theme_classic2(base_family = "sans")+
+theme(
+  plot.title=element_text(hjust=0.5, size = 14, face = "bold"),
+  plot.subtitle = element_text(size = 12, hjust=0.5),
+  axis.title = element_text(size = 12),
+  axis.text = element_text(size = 10),
+  legend.title = element_text(size = 14, face = "bold",hjust=0.5),
+  legend.text = element_text(size = 10, face = "bold"),
+  panel.border = element_rect(color = "black", fill = NA, linewidth = 1)))
+```
+
+## Define Welch's Reference vs. Shuffled T-Test Function
+```{r welchs_refvsshuf_function}
+welch_shuftest <- function(data_table,element,allele,null_values){
+  d <- filter(data_table,Allele==allele,Element==element)
+  if (nrow(d) < 3) {
+    return(c(element, NA, NA))
+  } else {
+  res <- t.test(d$Expression,null_values, var.equal=FALSE)
+  dif <- res$estimate[1] - res$estimate[2]
+  pval <- res$p.value
+  return(c(element,dif,pval))
+  }
+}
+```
+
+## Custom Function for Non-Parametric Sex Specific Element Effects
+```{r sex-specific_elements}
+
+library(data.table)
+library(progress)  # for progress bar
+
+analyze_expression_data <- function(dt, n_permutations = 10000) {
+  # Convert to data.table once and subset to only needed columns
+  if(!is.data.table(dt)) {
+    dt <- as.data.table(dt)[, .(Element, Expression, Allele, Sex)]
+  }
+  
+  # Pre-filter to remove NA/Inf/-Inf
+  dt <- dt[is.finite(Expression)]
+  setkey(dt, Element)
+  
+  # Function to analyze one element (optimized)
+  analyze_one_element <- function(element_data) {
+    # Get sample counts using fast data.table operations
+    counts <- element_data[, .N, by = .(Sex, Allele)]
+    setkey(counts, Sex, Allele)
+    
+    n_male_ref <- counts[.("m", "ref"), N]
+    n_female_ref <- counts[.("f", "ref"), N]
+    n_male_shuf <- counts[.("m", "shuf"), N]
+    n_female_shuf <- counts[.("f", "shuf"), N]
+    
+    # Early return if not enough samples
+    if(length(n_male_ref) == 0 || length(n_female_ref) == 0 || 
+       n_male_ref < 3 || n_female_ref < 3) {
+      return(c(
+        n_male_ref = ifelse(length(n_male_ref) == 0, 0, n_male_ref),
+        n_female_ref = ifelse(length(n_female_ref) == 0, 0, n_female_ref),
+        n_male_shuf = ifelse(length(n_male_shuf) == 0, 0, n_male_shuf),
+        n_female_shuf = ifelse(length(n_female_shuf) == 0, 0, n_female_shuf),
+        male_effect = NA_real_,
+        female_effect = NA_real_,
+        male_p = NA_real_,
+        female_p = NA_real_,
+        interaction_effect = NA_real_,
+        interaction_p = NA_real_
+      ))
+    }
+    
+    # Pre-calculate means
+    means <- element_data[, .(mean_expr = mean(Expression)), by = .(Sex, Allele)]
+    setkey(means, Sex, Allele)
+    
+    male_effect <- means[.("m", "ref"), mean_expr] - means[.("m", "shuf"), mean_expr]
+    female_effect <- means[.("f", "ref"), mean_expr] - means[.("f", "shuf"), mean_expr]
+    interaction_effect <- male_effect - female_effect
+    
+    perm_data <- element_data[, .(Expression, Sex, is_ref = (Allele == "ref"))]
+    perm_diffs <- numeric(n_permutations)
+    
+    # Create mini progress bar for permutations (updates every 1000 iterations)
+    for(i in 1:n_permutations) {
+      perm_data[Sex == "m", is_ref_perm := sample(is_ref[Sex == "m"])]
+      perm_data[Sex == "f", is_ref_perm := sample(is_ref[Sex == "f"])]
+      
+      perm_means <- perm_data[, .(mean_expr = mean(Expression)), by = .(Sex, is_ref_perm)]
+      setkey(perm_means, Sex, is_ref_perm)
+      
+      male_perm <- perm_means[.("m", TRUE), mean_expr] - perm_means[.("m", FALSE), mean_expr]
+      female_perm <- perm_means[.("f", TRUE), mean_expr] - perm_means[.("f", FALSE), mean_expr]
+      perm_diffs[i] <- male_perm - female_perm
+    }
+    
+    male_p <- mean(abs(perm_diffs) >= abs(male_effect))
+    female_p <- mean(abs(perm_diffs) >= abs(female_effect))
+    interaction_p <- mean(abs(perm_diffs) >= abs(interaction_effect))
+    
+    return(c(
+      n_male_ref = n_male_ref,
+      n_female_ref = n_female_ref,
+      n_male_shuf = n_male_shuf,
+      n_female_shuf = n_female_shuf,
+      male_effect = male_effect,
+      female_effect = female_effect,
+      male_p = male_p,
+      female_p = female_p,
+      interaction_effect = interaction_effect,
+      interaction_p = interaction_p
+    ))
+  }
+  
+  elements <- dt[, unique(Element)]
+  n_elements <- length(elements)
+  
+  # Create progress bar for elements
+  pb <- progress_bar$new(
+    format = "Analyzing elements [:bar] :percent | Elapsed: :elapsed | ETA: :eta",
+    total = n_elements,
+    clear = FALSE,
+    width = 80
+  )
+  
+  # Process elements with progress bar
+  results <- rbindlist(lapply(seq_along(elements), function(i) {
+    elem <- elements[i]
+    res <- analyze_one_element(dt[Element == elem])
+    pb$tick()
+    if(i %% 100 == 0) {
+      cat(sprintf("\nProcessed %d/%d elements\n", i, n_elements))
+    }
+    as.list(c(Element = elem, res))
+  }))
+  
+  # Add adjusted p-values
+  cat("\nCalculating adjusted p-values...\n")
+  p_cols <- c("male_p", "female_p", "interaction_p")
+  for(col in p_cols) {
+    results[, paste0(col, "_fdr") := p.adjust(get(col), method = "BH")]
+    results[, paste0(col, "_bonf") := p.adjust(get(col), method = "bonferroni")]
+  }
+  
+  setkey(results, Element)
+  cat("Analysis complete!\n")
+  return(results)
+}
+
+```
+
+## Load Data
+```{r}
+
+d <- fread("../../data/formatted/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/formatted_Reads_08Mar2024.tsv")
+d$Fraction <- "RNA"
+dna <- fread("../../data/formatted/Library1and2BCLess_ISOMPRA_In_Vivo_NOTRAP_06Mar2024/formatted_viral_reads.tsv")
+dna <- aggregate.counts(dna,"Fraction","Plasmid DNA","DNA.AGG",c("BiolRep","TechRep"),c(1,1),c("Fraction","BiolRep")) %>% filter(Fraction=="DNA.AGG")
+dna <- tidyr::unite(dna,Element,c("Element","Library"))
+dna$Element <- str_replace_all(dna$Element,"_$","")
+dna <- dna[,1:9]
+setnames(dna,
+         c("BiolRep","CellType","SpliceStatus"),
+         c("Animal_Hemisphere","Cre_Type","Splicing_Pool"))
+d <- rbind(d,dna,fill=TRUE)
+
+d_temp <- d
+d_temp <- d_temp %>%
+  mutate(Fraction = if_else(Fraction == "RNA",
+                            paste(Cre_Type, Cre_Status, Splicing_Pool, sep = "_"),
+                            Fraction))
+
+d_temp <- d_temp[,c(1,2,4,7,8,9)]
+d_temp$BC <- 1
+#Let's filter for elements that are well represented
+#We need to filter separately for each of the types of libraries, but the Vgat
+#samples sequenced horribly, unacceptable correlations, so we'll only be looking
+#at excitatory neurons (Vglut1) and whole cortex
+
+Vglut1.OFF.Pre.to.test <- filter_elements(d_temp,
+                                          "Fraction",
+                                          "VGlut1_OFF_Pre",
+                                          "DNA.AGG",
+                                          min.bc = 1,
+                                          replicate.field = "Animal_Hemisphere")
+Vglut1.OFF.Post.to.test <- filter_elements(d_temp,
+                                          "Fraction",
+                                          "VGlut1_OFF_Post",
+                                          "DNA.AGG",
+                                          min.bc = 1,
+                                          replicate.field = "Animal_Hemisphere")
+Vglut1.ON.Pre.to.test <- filter_elements(d_temp,
+                                          "Fraction",
+                                          "VGlut1_ON_Pre",
+                                          "DNA.AGG",
+                                          min.bc = 1,
+                                          replicate.field = "Animal_Hemisphere")
+Vglut1.ON.Post.to.test <- filter_elements(d_temp,
+                                          "Fraction",
+                                          "VGlut1_ON_Post",
+                                          "DNA.AGG",
+                                          min.bc = 1,
+                                          replicate.field = "Animal_Hemisphere")
+
+#It took forever to generate these lists of testable elements that passed QC,
+#save them so I don't have to regenerate
+fwrite(Vglut1.OFF.Post.to.test,"Vglut1_Cre-OFF_Post_TestingElements.txt",sep="\t")
+fwrite(Vglut1.ON.Post.to.test,"Vglut1_Cre-ON_Post_TestingElements.txt",sep="\t")
+fwrite(Vglut1.OFF.Pre.to.test,"Vglut1_Cre-OFF_Pre_TestingElements.txt",sep="\t")
+fwrite(Vglut1.ON.Pre.to.test,"Vglut1_Cre-ON_Pre_TestingElements.txt",sep="\t")
+
+#We'll use edgeR to normalize the counts, keep it separate
+#for each type of library and combine at the end
+
+d_norm <- rbind(
+  normalize.counts.edgeR(
+    filter(d,Cre_Type=="VGlut1",Cre_Status=="OFF",Splicing_Pool=="Pre"),
+    sample.fields = c("Cre_Type","Animal_Hemisphere","Cre_Status","Splicing_Pool"),
+    element.fields = c("Element","Allele")),
+  normalize.counts.edgeR(
+    filter(d,Cre_Type=="VGlut1",Cre_Status=="OFF",Splicing_Pool=="Post"),
+    sample.fields = c("Cre_Type","Animal_Hemisphere","Cre_Status","Splicing_Pool"),
+    element.fields = c("Element","Allele")),
+  normalize.counts.edgeR(
+    filter(d,Cre_Type=="VGlut1",Cre_Status=="ON",Splicing_Pool=="Pre"),
+    sample.fields = c("Cre_Type","Animal_Hemisphere","Cre_Status","Splicing_Pool"),
+    element.fields = c("Element","Allele")),
+  normalize.counts.edgeR(
+    filter(d,Cre_Type=="VGlut1",Cre_Status=="ON",Splicing_Pool=="Post"),
+    sample.fields = c("Cre_Type","Animal_Hemisphere","Cre_Status","Splicing_Pool"),
+    element.fields = c("Element","Allele"))
+)
+
+
+d_expr <- left_join(d_norm,dna[,c(1,2,4)],c("Element","Allele")) %>%
+  mutate(Expression=log2(CPM.x/CPM.y))
+d_expr <- as.data.table(d_expr)
+
+fwrite(d_expr[,c(1,2,3,4,5,6,9)],"Vglut1-Cre Expression Table.csv")
+
+#Note here, this wasn't available in the original data table, but any biolrep (L or R)
+#1-5 was male, 6-10 was female.  If running Vgat (not advised), 1-4 was male, 5-8 was female
+d_expr[, Sex := {
+    # Extract only numeric characters and convert to number
+    num <- as.numeric(gsub("[^0-9]", "", Animal_Hemisphere))
+    # Assign sex based on number range
+    ifelse(num >= 1 & num <= 5, "m",
+           ifelse(num >= 6 & num <= 10, "f", NA_character_))
+  }]
+d_expr <- as.data.table(d_expr)
+
+fwrite(d_expr,"Vglut1-Cre Expression Table.csv")
+```
+
+##Reference vs. Variant
+```{r Linear Modeling}
+#We will run these tests separately for cell type
+# Refer to the figure_making folder for an MDS plot of biological replicates,
+# based on that analysis we will be dropping the following from the modeling
+# as they correlated poorly:
+# 2R and 5R from Cre+ pre-splicing
+# 2R from Cre- pre-splicing
+# 2R and 4R from Cre+ post-splicing
+# 3R from Cre- post-splicing
+d_expr <- fread("./Vglut1-Cre Expression Table.csv")
+Vglut1.OFF.Pre.to.test <- fread("./Vglut1_Cre-OFF_Pre_TestingElements.txt", sep = "\t")
+Vglut1.ON.Pre.to.test <- fread("./Vglut1_Cre-ON_Pre_TestingElements.txt", sep = "\t")
+Vglut1.OFF.Post.to.test <- fread("./Vglut1_Cre-OFF_Post_TestingElements.txt", sep = "\t")
+Vglut1.ON.Post.to.test <- fread("./Vglut1_Cre-ON_Post_TestingElements.txt", sep = "\t")
+```
+
+###Pre-Splicing Whole Cortex
+```{r pre_cortex_refvsalt}
+#Pre-Splicing
+res <- mpratools.lm(filter(d_expr,
+                      Element %in% Vglut1.OFF.Pre.to.test$Element,
+                      is.finite(Expression),
+                      Cre_Status=="OFF",
+                      Splicing_Pool=="Pre",
+                      Animal_Hemisphere!="2R",
+                      is.finite(Expression)))
+fwrite(res,"Pre-Splicing_Vglut1_CreOFF_RefvsAlt_LM.tsv", sep = "\t")
+
+fwrite(
+  full_join(
+    fread("./Pre-Splicing_Vglut1_CreOFF_RefvsAlt_LM.tsv"),
+    fread("../../code/mpra_tools/fullannotationtable.txt"))
+  ,"Pre-Splicing_Vglut1_CreOFF_RefvsAlt_LM_Annotated.tsv", sep = "\t")
+```
+
+###Pre-Splicing Excitatory Neurons
+```{r pre_exn_refvsalt}
+res <- mpratools.lm(filter(d_expr,
+                      Element %in% Vglut1.ON.Pre.to.test$Element,
+                      is.finite(Expression),
+                      Cre_Status=="ON",
+                      Animal_Hemisphere!="2R",
+                      Animal_Hemisphere!="5R",
+                      Splicing_Pool=="Pre",
+                      is.finite(Expression)))
+fwrite(res,"Pre-Splicing_Vglut1_CreON_RefvsAlt_LM.tsv",sep = "\t")
+fwrite(
+  full_join(
+    fread("./Pre-Splicing_Vglut1_CreON_RefvsAlt_LM.tsv"),
+    fread("../../code/mpra_tools/fullannotationtable.txt"))
+  ,"Pre-Splicing_Vglut1_CreON_RefvsAlt_LM_Annotated.tsv", sep = "\t")
+```
+
+###Post-Splicing Whole Cortex
+```{r post_cortex_refvsalt}
+res <- mpratools.lm(filter(d_expr,
+                      Element %in% Vglut1.OFF.Post.to.test$Element,
+                      is.finite(Expression),
+                      Cre_Status=="OFF",
+                      Animal_Hemisphere!="3R",
+                      Splicing_Pool=="Post",
+                      is.finite(Expression)))
+fwrite(res,"Post-Splicing_Vglut1_CreOFF_RefvsAlt_LM.tsv", sep = "\t")
+fwrite(
+  full_join(
+    fread("./Post-Splicing_Vglut1_CreOFF_RefvsAlt_LM.tsv"),
+    fread("../../code/mpra_tools/fullannotationtable.txt"))
+  ,"Post-Splicing_Vglut1_CreOFF_RefvsAlt_LM_Annotated.tsv", sep = "\t")
+```
+
+###Post-Splicing Excitatory Neurons
+```{r post_exn_refvsalt}
+res <- mpratools.lm(filter(d_expr,
+                      Element %in% Vglut1.ON.Post.to.test$Element,
+                      is.finite(Expression),
+                      Cre_Status=="ON",
+                      Animal_Hemisphere!="2R",
+                      Animal_Hemisphere!="4R",
+                      Splicing_Pool=="Post",
+                      is.finite(Expression)))
+fwrite(res,"Post-Splicing_Vglut1_CreON_RefvsAlt_LM.tsv", sep = "\t")
+fwrite(
+  full_join(
+    fread("./Post-Splicing_Vglut1_CreON_RefvsAlt_LM.tsv"),
+    fread("../../code/mpra_tools/fullannotationtable.txt"))
+  ,"Post-Splicing_Vglut1_CreON_RefvsAlt_LM_Annotated.tsv", sep = "\t")
+```
+
+### Stability Whole Cortex
+```{r stability_cortex}
+res <- mpratools.lm.int(d = filter(d_expr,Element %in%
+                                               intersect(Vglut1.OFF.Pre.to.test$Element,
+                                                         Vglut1.OFF.Post.to.test$Element),
+                                             is.finite(Expression),
+                                             Cre_Status=="OFF",
+                                   !(Animal_Hemisphere=="3R" & Splicing_Pool=="Post"),
+                                   !(Animal_Hemisphere=="2R" & Splicing_Pool=="Pre")),
+                                  model = Expression ~ Allele * Splicing_Pool)
+fwrite(res,"Stability_Vglut1_CreOFF_RefvsAlt_LM.tsv", sep="\t")
+fwrite(
+  full_join(
+    fread("./Stability_Vglut1_CreOFF_RefvsAlt_LM.tsv"),
+    fread("../../code/mpra_tools/fullannotationtable.txt"))
+  ,"Stability_Vglut1_CreOFF_RefvsAlt_LM_Annotated.tsv", sep = "\t")
+```
+
+###Stability Excitatory Neurons
+```{r stability_exn}
+res <- mpratools.lm.int(d = filter(d_expr,
+                                Element %in% intersect(Vglut1.ON.Pre.to.test$Element,
+                                                       Vglut1.ON.Post.to.test$Element),
+                                is.finite(Expression),
+                                Cre_Status=="ON",
+                                Animal_Hemisphere!="2R",
+                                !(Animal_Hemisphere=="4R" & Splicing_Pool=="Post"),
+                                !(Animal_Hemisphere=="5R" & Splicing_Pool=="Pre")),
+                     model = Expression ~ Allele * Splicing_Pool)
+fwrite(res,"Stability_Vglut1_CreON_RefvsAlt_LM.tsv", sep = "\t")
+fwrite(
+  full_join(
+    fread("./Stability_Vglut1_CreON_RefvsAlt_LM.tsv"),
+    fread("../../code/mpra_tools/fullannotationtable.txt"))
+  ,"Stability_Vglut1_CreON_RefvsAlt_LM_Annotated.tsv", sep = "\t") 
+
+```
+
+##Reference vs. Shuffled
+###Pre-Splicing Whole Cortex
+```{r pre_cortex_refvsshuf}
+
+nulls <- as.data.table(filter(d_expr,
+                              Allele=="shuf",
+                              Cre_Status=="OFF",
+                              Splicing_Pool=="Pre",
+                              is.finite(Expression)) %>% 
+                         group_by(Element) %>% 
+                         summarize(Expression=mean(Expression)))
+pre_OFF_shuf <- lapply(Vglut1.OFF.Pre.to.test$Element, function(element) {
+  welch_shuftest(data_table = filter(d_expr,
+                              Cre_Status=="OFF",
+                              Splicing_Pool=="Pre",
+                              is.finite(Expression)),
+                 element = element,
+                 allele = "ref",
+                 null_values=nulls$Expression)
+})
+pre_OFF_shuf <- as.data.table(do.call(rbind,pre_OFF_shuf))
+setnames(pre_OFF_shuf,,c("Element","logFC","p.val"))
+pre_OFF_shuf$fdr <- p.adjust(pre_OFF_shuf$p.val,method = "fdr")
+fwrite(pre_OFF_shuf,"Pre-Splicing_Vglut1_CreOFF_RefvsShuf_Welchs.tsv", sep="\t")
+fwrite(full_join(pre_OFF_shuf,fread("../../code/mpra_tools/fullannotationtable.txt"))[,!c("Pos","Ref","Alt","Type","Pheno","library_seq_alt","library_seq_shuf")],"Pre-Splicing_Vglut1_CreOFF_RefvsShuf_Welchs_Annotated.tsv", sep="\t")
+```
+
+###Pre-Splicing Excitatory Neurons
+```{r pre_exn_refvsshuf}
+#Pre-Splicing Cre-ON
+nulls <- as.data.table(filter(d_expr,
+                              Allele=="shuf",
+                              Cre_Status=="ON",
+                              Splicing_Pool=="Pre",
+                              is.finite(Expression)) %>% 
+                         group_by(Element) %>% 
+                         summarize(Expression=mean(Expression)))
+pre_ON_shuf <- lapply(Vglut1.ON.Pre.to.test$Element, function(element) {
+  welch_shuftest(data_table = filter(d_expr,
+                              Cre_Status=="ON",
+                              Splicing_Pool=="Pre",
+                              is.finite(Expression)),
+                 element = element,
+                 allele = "ref",
+                 null_values=nulls$Expression)
+})
+pre_ON_shuf <- as.data.table(do.call(rbind,pre_ON_shuf))
+setnames(pre_ON_shuf,,c("Element","logFC","p.val"))
+pre_ON_shuf$fdr <- p.adjust(pre_ON_shuf$p.val,method = "fdr")
+fwrite(pre_ON_shuf,"Pre-Splicing_Vglut1_CreON_RefvsShuf_Welchs.tsv", sep="\t")
+fwrite(full_join(pre_ON_shuf,fread("../../code/mpra_tools/fullannotationtable.txt"))[,!c("Pos","Ref","Alt","Type","Pheno","library_seq_alt","library_seq_shuf")],"Pre-Splicing_Vglut1_CreON_RefvsShuf_Welchs_Annotated.tsv", sep="\t")
+```
+
+###Post-Splicing Whole Cortex
+```{r post_cortex_refvsshuf}
+#Post-Splicing Cre-OFF
+nulls <- as.data.table(filter(d_expr,
+                              Allele=="shuf",
+                              Cre_Status=="OFF",
+                              Splicing_Pool=="Post",
+                              is.finite(Expression)) %>% 
+                         group_by(Element) %>% 
+                         summarize(Expression=mean(Expression)))
+post_OFF_shuf <- lapply(Vglut1.OFF.Post.to.test$Element, function(element) {
+  welch_shuftest(data_table = filter(d_expr,
+                              Cre_Status=="OFF",
+                              Splicing_Pool=="Post",
+                              is.finite(Expression)),
+                 element = element,
+                 allele = "ref",
+                 null_values=nulls$Expression)
+})
+post_OFF_shuf <- as.data.table(do.call(rbind,post_OFF_shuf))
+setnames(post_OFF_shuf,,c("Element","logFC","p.val"))
+post_OFF_shuf$fdr <- p.adjust(post_OFF_shuf$p.val,method = "fdr")
+fwrite(post_OFF_shuf,"Post-Splicing_Vglut1_CreOFF_RefvsShuf_Welchs.tsv", sep="\t")
+fwrite(full_join(post_OFF_shuf,fread("../../code/mpra_tools/fullannotationtable.txt"))[,!c("Pos","Ref","Alt","Type","Pheno","library_seq_alt","library_seq_shuf")],"Post-Splicing_Vglut1_CreOFF_RefvsShuf_Welchs_Annotated.tsv", sep="\t")
+```
+
+###Post-Splicing Excitatory Neurons
+```{r post_exn_refvsshuf}
+#Post-Splicing Cre-ON
+nulls <- as.data.table(filter(d_expr,
+                              Allele=="shuf",
+                              Cre_Status=="ON",
+                              Splicing_Pool=="Post",
+                              is.finite(Expression)) %>% 
+                         group_by(Element) %>% 
+                         summarize(Expression=mean(Expression)))
+post_ON_shuf <- lapply(Vglut1.ON.Post.to.test$Element, function(element) {
+  welch_shuftest(data_table = filter(d_expr,
+                              Cre_Status=="ON",
+                              Splicing_Pool=="Post",
+                              is.finite(Expression)),
+                 element = element,
+                 allele = "ref",
+                 null_values=nulls$Expression)
+})
+post_ON_shuf <- as.data.table(do.call(rbind,post_ON_shuf))
+setnames(post_ON_shuf,,c("Element","logFC","p.val"))
+post_ON_shuf$fdr <- p.adjust(post_ON_shuf$p.val,method = "fdr")
+fwrite(post_ON_shuf,"Post-Splicing_Vglut1_CreON_RefvsShuf_Welchs.tsv", sep="\t")
+fwrite(full_join(post_ON_shuf,fread("../../code/mpra_tools/fullannotationtable.txt"))[,!c("Pos","Ref","Alt","Type","Pheno","library_seq_alt","library_seq_shuf")],"Post-Splicing_Vglut1_CreON_RefvsShuf_Welchs_Annotated.tsv", sep="\t")
+```
+
+###Stability Whole Cortex
+```{r stability_cortex_refvsshuf}
+#We cannot do an interaction model for non-parametric (well, we can, but it's
+#complicated), so we are going to subtract pre from post expression to get "stability"
+stability_OFF <- inner_join(
+  filter(d_expr,Cre_Status=="OFF",Splicing_Pool=="Pre"),
+  filter(d_expr,Cre_Status=="OFF",Splicing_Pool=="Post"),
+  by=c("Element","Allele","Animal_Hemisphere"))
+stability_OFF[,Expression := Expression.y-Expression.x]
+
+elems <- unique(stability_OFF$Element)
+nulls <- as.data.table(filter(stability_OFF,Allele=="shuf") %>% group_by(Element) %>%
+    summarize(Expression=mean(Expression)))
+
+stab_shuf_OFF <- lapply(elems, function(element) {
+  welch_shuftest(data_table = filter(stability_OFF,is.finite(Expression)), element = element, allele = "ref",null_values=is.finite(nulls$Expression))
+})
+stab_shuf_OFF <- as.data.table(do.call(rbind,stab_shuf_OFF))
+setnames(stab_shuf_OFF,,c("Element","logFC","p.val"))
+stab_shuf_OFF$fdr <- p.adjust(stab_shuf_OFF$p.val,method = "fdr")
+fwrite(stab_shuf_OFF,"Stability_Vglut1_CreOFF_RefvsShuf_Welchs.tsv")
+fwrite(full_join(stab_shuf_OFF,fread("../../code/mpra_tools/fullannotationtable.txt"))[,!c("Pos","Ref","Alt","Type","Pheno","library_seq_alt","library_seq_shuf")],"Stability_Vglut1_CreOFF_RefvsShuf_Welchs_Annotated.tsv", sep="\t")
+```
+
+###Stability Excitatory Neurons
+```{r stability_exn_refvsshuf}
+
+stability_ON <- inner_join(
+  filter(d_expr,Cre_Status=="ON",Splicing_Pool=="Pre"),
+  filter(d_expr,Cre_Status=="ON",Splicing_Pool=="Post"),
+  by=c("Element","Allele","Animal_Hemisphere"))
+stability_ON[,Expression := Expression.y-Expression.x]
+
+elems <- unique(stability_ON$Element)
+nulls <- as.data.table(filter(stability_ON,Allele=="shuf") %>% group_by(Element) %>%
+    summarize(Expression=mean(Expression)))
+
+stab_shuf_ON <- lapply(elems, function(element) {
+  welch_shuftest(data_table = filter(stability_ON,is.finite(Expression)), element = element, allele = "ref",null_values=is.finite(nulls$Expression))
+})
+
+stab_shuf_ON <- as.data.table(do.call(rbind,stab_shuf_ON))
+setnames(stab_shuf_ON,,c("Element","logFC","p.val"))
+stab_shuf_ON$fdr <- p.adjust(stab_shuf_ON$p.val,method = "fdr")
+fwrite(stab_shuf_ON,"Stability_Vglut1_CreON_RefvsShuf_Welchs.tsv")
+fwrite(full_join(stab_shuf_ON,fread("../../code/mpra_tools/fullannotationtable.txt"))[,!c("Pos","Ref","Alt","Type","Pheno","library_seq_alt","library_seq_shuf")],"Stability_Vglut1_CreON_RefvsShuf_Welchs_Annotated.tsv", sep="\t")
+```
+
+
+##Sex Specific Effects
+###Define Three-Term Interaction Model
+```{r threeway_int_function}
+library(emmeans)
+d_expr <- fread("./Vglut1-Cre Expression Table.csv")
+
+mpratools.lm.int.threeway <- function(dt, # The data table in question
+                          response = "Expression", # The value you want to examine, usually Expression
+                          factor1 = "Allele", # The first predictor, usually Allele
+                          factor2 = "Splicing_Pool", # The second predictor, usually Splicing_Pool
+                          factor3 = "Sex", # The third predictor, usually Sex
+                          levels_factor1 = c("ref", "alt"), # Order of predictor1, usually c("ref", "alt")
+                          levels_factor2 = c("Pre", "Post"), # Order of predictor2, usually c("Pre", "Post")
+                          levels_factor3 = c("m", "f"), # Order of predictor3, usually c("m", "f")
+                          separator = "Element") { # What to separate on, usually Element
+  # Ensure data is in data.table format
+  setDT(dt)
+  
+  # Set factor levels if provided
+  dt[, (factor1) := factor(get(factor1), levels = levels_factor1)]
+  dt[, (factor2) := factor(get(factor2), levels = levels_factor2)]
+  dt[, (factor3) := factor(get(factor3), levels = levels_factor3)]
+  
+  # Construct the model formula
+  formula <- as.formula(paste(response, "~", factor1, "*", factor2, "*", factor3))
+  
+  # Define the result columns dynamically
+  coef_cols <- c(
+    paste0("logFC_", c(factor1, factor2, factor3,
+                       paste0(factor1, ":", factor2),
+                       paste0(factor1, ":", factor3),
+                       paste0(factor2, ":", factor3),
+                       paste0(factor1, ":", factor2, ":", factor3))),
+    paste0("pval_", c(factor1, factor2, factor3,
+                      paste0(factor1, ":", factor2),
+                      paste0(factor1, ":", factor3),
+                      paste0(factor2, ":", factor3),
+                      paste0(factor1, ":", factor2, ":", factor3)))
+  )
+  
+  # Initialize an empty results table with proper column types
+  n_elements <- length(unique(dt[[separator]]))
+  res_table <- data.table(
+    separator_col = character(n_elements)
+  )
+  setnames(res_table, "separator_col", separator)
+  
+  # Add numeric columns for logFC and p-values
+  for(col in coef_cols) {
+    res_table[, (col) := rep(NA_real_, n_elements)]
+  }
+  
+  # Assign separator values
+  res_table[[separator]] <- unique(dt[[separator]])
+  
+  # Loop over each unique separator value
+  for (i in seq_len(nrow(res_table))) {
+    sep_value <- res_table[[separator]][i]
+    # Subset the data for the current separator
+    dt_subset <- dt[get(separator) == sep_value]
+    
+    # Check if there are at least 3 measurements per combination
+    valid_combinations <- dt_subset[, .N, by = .(get(factor1), get(factor2), get(factor3))][N >= 3]
+    if (nrow(valid_combinations) < 8) {
+      next  # Skip this separator if fewer than 8 valid combinations
+    }
+    
+    # Try fitting the model
+    tryCatch({
+      model <- lm(formula, data = dt_subset)
+      coef_values <- as.data.table(coef(summary(model)))
+      
+      # Get the number of coefficients (excluding intercept)
+      n_coef <- nrow(coef_values) - 1
+      
+      # Extract logFC values (coefficients)
+      logfc_cols <- grep("^logFC_", names(res_table), value = TRUE)
+      for (col_idx in seq_along(logfc_cols)) {
+        res_table[i, (logfc_cols[col_idx]) := coef_values[col_idx + 1, 1]]
+      }
+      
+      # Extract p-values
+      pval_cols <- grep("^pval_", names(res_table), value = TRUE)
+      for (col_idx in seq_along(pval_cols)) {
+        res_table[i, (pval_cols[col_idx]) := coef_values[col_idx + 1, 4]]
+      }
+      
+    }, error = function(e) {
+      # On error, fill all coefficient columns with NA
+      coef_cols <- names(res_table)[-1]  # All columns except separator
+      res_table[i, (coef_cols) := NA_real_]
+    })
+  }
+  
+  # Calculate FDR and Bonferroni corrections for each p-value column
+  pval_cols <- grep("^pval_", names(res_table), value = TRUE)
+  for(pval_col in pval_cols) {
+    # Create column names for corrections
+    fdr_col <- gsub("^pval_", "fdr_", pval_col)
+    bonf_col <- gsub("^pval_", "bonf_", pval_col)
+    
+    # Calculate corrections
+    res_table[, (fdr_col) := p.adjust(get(pval_col), method = "fdr")]
+    res_table[, (bonf_col) := p.adjust(get(pval_col), method = "bonferroni")]
+  }
+  
+  return(res_table)
+}
+```
+
+###Sex-Specific Whole Cortex Variants
+```{r run_threeway_cortex}
+res <- mpratools.lm.int.threeway(d = filter(d_expr,Element %in%
+                                               intersect(Vglut1.OFF.Pre.to.test$Element,
+                                                         Vglut1.OFF.Post.to.test$Element),
+                                             is.finite(Expression),
+                                             Cre_Status=="OFF",
+                                   !(Animal_Hemisphere=="3R" & Splicing_Pool=="Post"),
+                                   !(Animal_Hemisphere=="2R" & Splicing_Pool=="Pre")))
+fwrite(res,"Stability_Vglut1_CreOFF_AllelevsSplicevsSex_LM.tsv", sep="\t")
+fwrite(
+  full_join(
+    fread("./Stability_Vglut1_CreOFF_AllelevsSplicevsSex_LM.tsv"),
+    fread("../../code/mpra_tools/fullannotationtable.txt"))
+  ,"Stability_Vglut1_CreOFF_AllelevsSplicevsSex_LM_Annotated.tsv", sep = "\t")
+```
+
+###Sex-Specific Excitatory Neurons Variants
+```{r run_threeway_exn}
+res <- mpratools.lm.int.threeway(d = filter(d_expr,
+                                Element %in% intersect(Vglut1.ON.Pre.to.test$Element,
+                                                       Vglut1.ON.Post.to.test$Element),
+                                is.finite(Expression),
+                                Cre_Status=="ON",
+                                Animal_Hemisphere!="2R",
+                                !(Animal_Hemisphere=="4R" & Splicing_Pool=="Post"),
+                                !(Animal_Hemisphere=="5R" & Splicing_Pool=="Pre")))
+
+fwrite(res,"Stability_Vglut1_CreON_AllelevsSplicevsSex_LM.tsv", sep = "\t")
+fwrite(
+  full_join(
+    fread("./Stability_Vglut1_CreON_AllelevsSplicevsSex_LM.tsv"),
+    fread("../../code/mpra_tools/fullannotationtable.txt"))
+  ,"Stability_Vglut1_CreON_AllelevsSplicevsSex_LM_Annotated.tsv", sep = "\t") 
+```
+
+###Element-Level Expression Sex Differences
+
+```{r}
+#Further delving into sex-specific effects, we will use mpratools.lm to
+#investigate element by element expression differences, but use tidyr::unite
+#to join element and allele
+#so we can feed it the whole data table, then separate later
+d_expr <- fread("./Vglut1-Cre Expression Table.csv")
+
+Vglut1.OFF.Pre.to.test <- fread("./Vglut1_Cre-OFF_Pre_TestingElements.txt", sep = "\t")
+Vglut1.ON.Pre.to.test <- fread("./Vglut1_Cre-ON_Pre_TestingElements.txt", sep = "\t")
+Vglut1.OFF.Post.to.test <- fread("./Vglut1_Cre-OFF_Post_TestingElements.txt", sep = "\t")
+Vglut1.ON.Post.to.test <- fread("./Vglut1_Cre-ON_Post_TestingElements.txt", sep = "\t")
+```
+
+####Male vs. Female Pre-Splicing Whole Cortex
+```{r mvsf_pre_cortex}
+res <- mpratools.lm(filter(d_expr,
+                      Element %in% Vglut1.OFF.Pre.to.test$Element,
+                      is.finite(Expression),
+                      Cre_Status=="OFF",
+                      Animal_Hemisphere!="2R",
+                      Splicing_Pool=="Pre",
+                      is.finite(Expression)) %>%
+                      tidyr::unite(.,Element,c("Element",
+                                        "Allele"),sep="@"),
+                    Expression ~ Sex,,
+                    "Sex",
+                    "m",
+                    "f")
+res <- tidyr::separate(res,Element,c("Element","Allele"),sep="@")
+fwrite(res,"Pre-Splicing_Vglut1_CreOFF_MvsF_LM.tsv", sep = "\t")
+
+fwrite(
+  full_join(
+    fread("./Pre-Splicing_Vglut1_CreOFF_MvsF_LM.tsv"),
+    fread("../../code/mpra_tools/fullannotationtable.txt"))
+  ,"Pre-Splicing_Vglut1_CreOFF_MvsF_LM_Annotated.tsv", sep = "\t")
+```
+
+####Male vs. Female Pre-Splicing Excitatory Neurons
+```{r mvsf_pre_exn}
+res <- mpratools.lm(filter(d_expr,
+                      Element %in% Vglut1.ON.Pre.to.test$Element,
+                      is.finite(Expression),
+                      Cre_Status=="ON",
+                      Splicing_Pool=="Pre",
+                      Animal_Hemisphere!="2R",
+                      Animal_Hemisphere!="5R",
+                      is.finite(Expression)) %>%
+                      tidyr::unite(.,Element,c("Element",
+                                        "Allele"),sep="@"),
+                    Expression ~ Sex,,
+                    "Sex",
+                    "m",
+                    "f")
+res <- tidyr::separate(res,Element,c("Element","Allele"),sep="@")
+fwrite(res,"Pre-Splicing_Vglut1_CreON_MvsF_LM.tsv",sep = "\t")
+fwrite(
+  full_join(
+    fread("./Pre-Splicing_Vglut1_CreON_MvsF_LM.tsv"),
+    fread("../../code/mpra_tools/fullannotationtable.txt"))
+  ,"Pre-Splicing_Vglut1_CreON_MvsF_LM_Annotated.tsv", sep = "\t")
+```
+
+####Male vs. Female Post-Splicing Whole Cortex
+```{r mvsf_post_cortex}
+res <- mpratools.lm(filter(d_expr,
+                      Element %in% Vglut1.OFF.Post.to.test$Element,
+                      is.finite(Expression),
+                      Cre_Status=="OFF",
+                      Splicing_Pool=="Post",
+                      Animal_Hemisphere!="3R",
+                      is.finite(Expression)) %>%
+                      tidyr::unite(.,Element,c("Element",
+                                        "Allele"),sep="@"),
+                    Expression ~ Sex,,
+                    "Sex",
+                    "m",
+                    "f")
+res <- tidyr::separate(res,Element,c("Element","Allele"),sep="@")
+fwrite(res,"Post-Splicing_Vglut1_CreOFF_MvsF_LM.tsv", sep = "\t")
+fwrite(
+  full_join(
+    fread("./Post-Splicing_Vglut1_CreOFF_MvsF_LM.tsv"),
+    fread("../../code/mpra_tools/fullannotationtable.txt"))
+  ,"Post-Splicing_Vglut1_CreOFF_MvsF_LM_Annotated.tsv", sep = "\t")
+```
+
+####Male vs. Female Post-Splicing Excitatory Neurons
+```{r mvsf_post_exn}
+res <- mpratools.lm(filter(d_expr,
+                      Element %in% Vglut1.ON.Post.to.test$Element,
+                      is.finite(Expression),
+                      Cre_Status=="ON",
+                      Splicing_Pool=="Post",
+                      Animal_Hemisphere!="2R",
+                      Animal_Hemisphere!="4R",
+                      is.finite(Expression)) %>%
+                      tidyr::unite(.,Element,c("Element",
+                                        "Allele"),sep="@"),
+                    Expression ~ Sex,,
+                    "Sex",
+                    "m",
+                    "f")
+res <- tidyr::separate(res,Element,c("Element","Allele"),sep="@")
+fwrite(res,"Post-Splicing_Vglut1_CreON_MvsF_LM.tsv", sep = "\t")
+fwrite(
+  full_join(
+    fread("./Post-Splicing_Vglut1_CreON_MvsF_LM.tsv"),
+    fread("../../code/mpra_tools/fullannotationtable.txt"))
+  ,"Post-Splicing_Vglut1_CreON_MvsF_LM_Annotated.tsv", sep = "\t")
+```
+
+
+###Interaction Modeling of Allele and Sex on Expression
+
+```{read_data}
+################################################################################
+#Now we can do the allele*sex interaction
+d_expr <- fread("./Vglut1-Cre Expression Table.csv")
+#Set the sex as a factor for the interaction modeling
+d_expr$Sex <- factor(d_expr$Sex,levels = c("m","f"))
+Vglut1.OFF.Pre.to.test <- fread("./Vglut1_Cre-OFF_Pre_TestingElements.txt")
+Vglut1.ON.Pre.to.test <- read.csv("./Vglut1_Cre-ON_Pre_TestingElements.txt")
+Vglut1.OFF.Post.to.test <- fread("./Vglut1_Cre-OFF_Post_TestingElements.txt")
+Vglut1.ON.Post.to.test <- fread("./Vglut1_Cre-ON_Post_TestingElements.txt")
+```
+
+####Pre-Splicing Whole Cortex
+```{r pre_allele-sex_cortex}
+res <- mpratools.lm.int(filter(d_expr,
+                      Element %in% Vglut1.OFF.Pre.to.test$Element,
+                      is.finite(Expression),
+                      Cre_Status=="OFF",
+                      Animal_Hemisphere!="2R",
+                      Splicing_Pool=="Pre",
+                      is.finite(Expression)),
+                    Expression ~ Allele*Sex,,
+                    "Allele",
+                    "ref",
+                    "alt")
+fwrite(res,"Pre-Splicing_Vglut1_CreOFF_AllelevsSex_LM.tsv", sep = "\t")
+fwrite(
+  full_join(
+    fread("./Pre-Splicing_Vglut1_CreOFF_AllelevsSex_LM.tsv"),
+    fread("../../code/mpra_tools/fullannotationtable.txt"))
+  ,"Pre-Splicing_Vglut1_CreOFF_AllelevsSex_LM_Annotated.tsv", sep = "\t")
+```
+
+####Pre-Splicing Excitatory Neurons
+```{r pre_allele-sex_exn}
+res <- mpratools.lm.int(filter(d_expr,
+                      Element %in% Vglut1.ON.Pre.to.test$Element,
+                      is.finite(Expression),
+                      Cre_Status=="ON",
+                      Splicing_Pool=="Pre",
+                      Animal_Hemisphere!="2R",
+                      Animal_Hemisphere!="5R",
+                      is.finite(Expression)),
+                    Expression ~ Allele*Sex,,
+                    "Allele",
+                    "ref",
+                    "alt")
+fwrite(res,"Pre-Splicing_Vglut1_CreON_AllelevsSex_LM.tsv",sep = "\t")
+fwrite(
+  full_join(
+    fread("./Pre-Splicing_Vglut1_CreON_AllelevsSex_LM.tsv"),
+    fread("../../code/mpra_tools/fullannotationtable.txt"))
+  ,"Pre-Splicing_Vglut1_CreON_AllelevsSex_LM_Annotated.tsv", sep = "\t")
+```
+
+####Post-Splicing Whole Cortex
+```{r post_allele-sex_cortex}
+res <- mpratools.lm.int(filter(d_expr,
+                      Element %in% Vglut1.OFF.Post.to.test$Element,
+                      is.finite(Expression),
+                      Cre_Status=="OFF",
+                      Splicing_Pool=="Post",
+                      Animal_Hemisphere!="3R",
+                      is.finite(Expression)),
+                    Expression ~ Allele*Sex,,
+                    "Allele",
+                    "ref",
+                    "alt")
+fwrite(res,"Post-Splicing_Vglut1_CreOFF_AllelevsSex_LM.tsv", sep = "\t")
+fwrite(
+  full_join(
+    fread("./Post-Splicing_Vglut1_CreOFF_AllelevsSex_LM.tsv"),
+    fread("../../code/mpra_tools/fullannotationtable.txt"))
+  ,"Post-Splicing_Vglut1_CreOFF_AllelevsSex_LM_Annotated.tsv", sep = "\t")
+```
+
+####Post-Splicing Excitatory Neurons
+```{r post_allele-sex_exn}
+res <- mpratools.lm.int(filter(d_expr,
+                      Element %in% Vglut1.ON.Post.to.test$Element,
+                      is.finite(Expression),
+                      Cre_Status=="ON",
+                      Splicing_Pool=="Post",
+                      Animal_Hemisphere!="2R",
+                      Animal_Hemisphere!="4R",
+                      is.finite(Expression)),
+                    Expression ~ Allele*Sex,,
+                    "Allele",
+                    "ref",
+                    "alt")
+fwrite(res,"Post-Splicing_Vglut1_CreON_AllelevsSex_LM.tsv", sep = "\t")
+fwrite(
+  full_join(
+    fread("./Post-Splicing_Vglut1_CreON_AllelevsSex_LM.tsv"),
+    fread("../../code/mpra_tools/fullannotationtable.txt"))
+  ,"Post-Splicing_Vglut1_CreON_AllelevsSex_LM_Annotated.tsv", sep = "\t")
+```
+
+###Excitatory Neurons vs. Whole Cortex Variant vs. Reference Stability Differences
+
+```{r read_data}
+#ILook at ExN vs. Cortex
+#Run three way, see if there are any effects
+d_expr <- fread("./Vglut1-Cre Expression Table.csv")
+d_expr$Sex <- factor(d_expr$Sex,levels = c("m","f"))
+Vglut1.OFF.Pre.to.test <- fread("./Vglut1_Cre-OFF_Pre_TestingElements.txt")
+Vglut1.ON.Pre.to.test <- read.csv("./Vglut1_Cre-ON_Pre_TestingElements.txt")
+Vglut1.OFF.Post.to.test <- fread("./Vglut1_Cre-OFF_Post_TestingElements.txt")
+Vglut1.ON.Post.to.test <- fread("./Vglut1_Cre-ON_Post_TestingElements.txt")
+```
+
+####Excitatory Neuron vs. Whole Cortex
+```{r }
+res <- mpratools.lm.int.threeway(d = filter(d_expr,
+                                Element %in% 
+                                  intersect(
+                                    intersect(Vglut1.ON.Pre.to.test$Element,
+                                              Vglut1.ON.Post.to.test$Element),
+                                    intersect(Vglut1.OFF.Pre.to.test$Element,
+                                              Vglut1.OFF.Post.to.test$Element)
+                                    ),
+                                is.finite(Expression),
+                                !(Animal_Hemisphere=="3R" & Splicing_Pool=="Post"),
+                                !(Animal_Hemisphere=="2R" & Splicing_Pool=="Pre"),
+                                Animal_Hemisphere!="2R",
+                                !(Animal_Hemisphere=="4R" & Splicing_Pool=="Post"),
+                                !(Animal_Hemisphere=="5R" & Splicing_Pool=="Pre")
+                                ),
+                                factor1 = "Allele",
+                                factor2 = "Splicing_Pool",
+                                factor3 = "Cre_Status",
+                                levels_factor3 = c("OFF","ON")
+)
+
+
+fwrite(res, "Vglut1_AllelevsSplicevsCreStatus_LM.tsv", sep="\t")
+fwrite(
+  full_join(
+    fread("./Vglut1_AllelevsSplicevsCreStatus_LM.tsv"),
+    fread("../../code/mpra_tools/fullannotationtable.txt")),
+  "./Vglut1_AllelevsSplicevsCreStatus_LM_Annotated.tsv", sep="\t")
+``` 

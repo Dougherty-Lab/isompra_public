@@ -1,0 +1,775 @@
+---
+title: "Untitled"
+author: "Anthony Fischer"
+date: "2026-04-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##Load in tools
+```{r include=FALSE}
+source("../../../code/mpra_tools/mpra_tools.R")
+library(fplot)
+```
+
+##Read in Data
+```{r Reading_In_Data, include=FALSE}
+d <- fread("../../../data/formatted/ActD_Trials_08Apr2026/formatted.txt")
+#Separate allele names
+d <- d %>%
+  separate_wider_regex(
+    cols = Element,
+    patterns = c(
+      Element = ".*",        # Match as much as possible (greedy)
+      "_",                   # Match the last underscore
+      Allele = "[^_]+"       # Match everything remaining that isn't an underscore
+    )
+  )
+d <- as.data.table(d)
+
+#Grab the DNA info
+dna <- fread("../../../data/formatted/Library1and2BCLess_ISOMPRA_6-30-2022/formatted_Reads_compiled_06-30-2022.tsv") %>% filter(Fraction=="DNA")
+dna <- dna %>% group_by(Element,Allele) %>% summarize(CPM=mean(CPM)) %>% as.data.table()
+```
+
+##Calculate Expression
+```{r expression_calculation}
+#Put the DNA info in the table, adjoining to correct element
+d <- as.data.table(left_join(d,dna,by=c("Element","Allele")))
+#Calculate expression
+d[, Expression := log2(CPM.x/CPM.y)]
+#Get rid of non-finite values
+d <- filter(d,is.finite(Expression))
+```
+
+##Calculate Library Coverage
+```{r Coverage}
+#Total coverage for each library
+# 1. Create a new summary table
+total_counts <- d[, .(TotalCounts = sum(Counts)), 
+                      by = .(Fraction, BiolRep, Splicing)]
+total_counts[,Coverage := TotalCounts/8690]
+``` 
+
+##Examine CPM and Expression Correlations
+```{r Correlation_Plots_NewData}
+#Let's look at correlation plots
+CPM_corrs <- d %>% 
+  pivot_wider(id_cols = c(Element,Allele),
+              names_from = c(Fraction,Splicing,BiolRep),
+              values_from = CPM.x) %>%
+  select(3:26) %>% cor(use = "pairwise.complete.obs") %>%
+  as.data.table(,keep.rownames = TRUE) %>% pivot_longer(2:25) %>% filter(rn<name)
+Exp_corrs <- d %>% 
+  pivot_wider(id_cols = c(Element,Allele),
+              names_from = c(Fraction,Splicing,BiolRep),
+              values_from = Expression) %>%
+  select(3:26) %>% cor(use = "pairwise.complete.obs") %>% 
+  as.data.table(,keep.rownames = TRUE) %>% pivot_longer(2:25) %>% filter(rn<name)
+ggplot(CPM_corrs,aes(x=rn,y=name,fill=value))+
+  geom_tile()+
+  geom_text(aes(label = round(value,2)))+
+  scale_fill_gradient2(low = "blue", 
+                       high = "red", 
+                       mid = "white", 
+                       midpoint = 0, 
+                       limit = c(-1, 1), 
+                       name = "Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  coord_fixed()+
+  labs(title="CPM Correlation")
+ggplot(Exp_corrs,aes(x=rn,y=name,fill=value))+
+  geom_tile()+
+  geom_text(aes(label = round(value,2)))+
+  scale_fill_gradient2(low = "blue", 
+                       high = "red", 
+                       mid = "white", 
+                       midpoint = 0, 
+                       limit = c(-1, 1), 
+                       name = "Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  coord_fixed()+
+  labs(title="Expression Correlation")
+
+#And look at the old data
+Exp_corrs <- filter(d_old,!grepl("TRAP",Comment)) %>% 
+  pivot_wider(id_cols = c(Element,Allele),
+              names_from = c(Comment,BiolRep,TechRep),
+              values_from = Expression) %>%
+  select(3:26) %>% cor(use = "pairwise.complete.obs") %>% 
+  as.data.table(,keep.rownames = TRUE) %>% pivot_longer(2:25) %>% filter(rn<name)
+ggplot(Exp_corrs,aes(x=rn,y=name,fill=value))+
+  geom_tile()+
+  geom_text(aes(label = round(value,2)))+
+  scale_fill_gradient2(low = "blue", 
+                       high = "red", 
+                       mid = "white", 
+                       midpoint = 0, 
+                       limit = c(-1, 1), 
+                       name = "Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  coord_fixed()+
+  labs(title="Exp Correlation")
+
+
+################################################################################
+#CPM PCA
+# 1. Transform: the data must be transformed first. Raw CPMs are often
+# "heteroscedastic" (the variance changes with the mean), which can trick PCA
+# into only looking at your highest-expressed elements. You learn something new
+#every day...
+pca_input <- d %>% 
+  pivot_wider(id_cols = c(Element,Allele),
+              names_from = c(Fraction,Splicing,BiolRep),
+              values_from = CPM.x) %>% tidyr::unite(.,Element,c("Element","Allele")) %>%
+  column_to_rownames("Element") %>%
+  select(1:24) %>%
+  mutate(across(everything(), ~log2(.x + 1))) %>%
+  t() # PCA expects samples in rows, elements in columns
+#Fill NAs with 0
+pca_input[is.na(pca_input)] <- 0
+
+# 2. Run PCA
+pca_res <- prcomp(pca_input, scale. = TRUE)
+
+# 3. Visualize
+as.data.frame(pca_res$x) %>%
+  rownames_to_column("Library") %>%
+  separate(Library, into = c("Fraction", "Splicing", "BiolRep"), sep = "_") %>%
+  ggplot(aes(x = PC1, y = PC2, fill = interaction(Fraction,Splicing))) +
+  geom_point(size = 4,shape=21) +
+  geom_polygon(stat = "ellipse", level=0.68, alpha=0.2, color="black")+
+  geom_text(aes(label = BiolRep), vjust = -1) + # Helps identify which rep is the outlier
+  labs(fill="Library",title="PCA of Library CPMs")+
+  theme(plot.title = element_text(hjust=0.5))
+  
+  
+################################################################################
+#Expression PCA
+# 1. Transform: Expression is already in log2 space
+pca_input <- d %>% 
+  pivot_wider(id_cols = c(Element,Allele),
+              names_from = c(Fraction,Splicing,BiolRep),
+              values_from = Expression) %>% tidyr::unite(.,Element,c("Element","Allele")) %>%
+  column_to_rownames("Element") %>%
+  select(1:24) %>%
+  t() # PCA expects samples in rows, elements in columns
+#Fill NAs with 0
+pca_input[is.na(pca_input)] <- 0
+
+# 2. Run PCA
+pca_res <- prcomp(pca_input, scale. = TRUE)
+
+# 3. Visualize
+as.data.frame(pca_res$x) %>%
+  rownames_to_column("Library") %>%
+  separate(Library, into = c("Fraction", "Splicing", "BiolRep"), sep = "_") %>%
+  ggplot(aes(x = PC1, y = PC2, fill = interaction(Fraction,Splicing))) +
+  geom_point(size = 4,shape=21) +
+  geom_polygon(stat = "ellipse", level=0.68, alpha=0.2,color="black")+
+  geom_text(aes(label = BiolRep), vjust = -1) + # Helps identify which rep is the outlier
+  labs(fill="Library",title="PCA of Library Expression")+
+  theme(plot.title = element_text(hjust=0.5))
+
+# It appears t11 biolrep 2 and t0 pre biolrep 3 are outliers.  Exclude them from the analysis.
+```
+
+## Reference vs. Shuffled
+### Generate Ref vs. Shuf Welch's T-Test Function
+```{r refshuf_function}
+# We are going to repeat the refshuf analysis for this dataset
+
+
+welch_shuftest <- function(data_table,element,allele,null_values){
+  d <- filter(data_table,Allele==allele,Element==element)
+  res <- t.test(d$Expression,null_values, var.equal=FALSE)
+  dif <- res$estimate[1] - res$estimate[2]
+  pval <- res$p.value
+  return(c(element,dif,pval))
+}
+```
+
+### Generate list of elements to test
+```{r testable}
+#Remove offending biolreps from list based on PCA and correlation heatmap
+d_new <- filter(d,
+            !(Splicing=="pre" & BiolRep==3),
+            !(Fraction=="11hr" & BiolRep==2))
+#Get new list of elements to test, knowing that 0hr Pre 3 and 11 hr post 2 are excluded
+# Generate lists of elements to test by counting number of times the element appears
+# (had an expression value calculated for how many biolreps)
+pre <- as.data.table(table(filter(d_new,Fraction=="0hr",Splicing=="pre", Counts>49)[,c("Element","Allele")]))
+pre <- pivot_wider(pre,1,names_from = "Allele",values_from = "N")
+pre <- filter(pre,alt>2,ref>2)
+post <- as.data.table(table(filter(d_new,Fraction=="0hr",Splicing=="post", Counts>49)[,c("Element","Allele")]))
+post <- pivot_wider(post,1,names_from = "Allele",values_from = "N")
+post <- filter(post,alt>2,ref>2)
+five <- as.data.table(table(filter(d_new,Fraction=="5hr",Splicing=="post", Counts>49)[,c("Element","Allele")]))
+five <- pivot_wider(five,1,names_from = "Allele",values_from = "N")
+five <- filter(five,alt>2,ref>2)
+eleven <- as.data.table(table(filter(d_new,Fraction=="11hr",Splicing=="post", Counts>49)[,c("Element","Allele")]))
+eleven <- pivot_wider(eleven,1,names_from = "Allele",values_from = "N")
+eleven <- filter(eleven,alt>2,ref>2)
+library(purrr)
+library(dplyr)
+elements <- list(pre$Element,post$Element,five$Element,eleven$Element) %>% purrr::reduce(intersect)
+```
+
+### Pre-Splicing Ref vs. Shuf
+```{r pre_refshuf}
+# Pre-Splicing
+nulls <- as.data.table(filter(d,Allele=="shuf",Fraction=="0hr",Splicing=="pre") %>% group_by(Element) %>%
+    summarize(Expression=mean(Expression)))
+intron_shuf <- lapply(elements, function(element) {
+  welch_shuftest(data_table = filter(d,Fraction=="0hr",Splicing=="pre"), element = element, allele = "ref",null_values=nulls$Expression)
+})
+intron_shuf <- as.data.table(do.call(rbind,intron_shuf))
+setnames(intron_shuf,,c("Element","logFC","p.val"))
+intron_shuf$fdr <- p.adjust(intron_shuf$p.val,method = "fdr")
+intron_shuf <- full_join(intron_shuf,fread("../../../code/mpra_tools/fullannotationtable.txt"))[,!c("Pos","Ref","Alt","Type","Pheno","library_seq_alt","library_seq_shuf")]
+fwrite(intron_shuf,"Pre-Splicing_RefvsShuf_Welchs.tsv")
+
+
+### Post-Splicing Ref vs. Shuf
+```{r post_refshuf}
+# Post-Splicing
+nulls <- as.data.table(filter(d,Allele=="shuf",Fraction=="0hr",Splicing=="post") %>% group_by(Element) %>%
+    summarize(Expression=mean(Expression)))
+exon_shuf <- lapply(elements, function(element) {
+  welch_shuftest(data_table = filter(d,Fraction=="0hr",Splicing=="post"), element = element, allele = "ref",null_values=nulls$Expression)
+})
+exon_shuf <- as.data.table(do.call(rbind,exon_shuf))
+setnames(exon_shuf,,c("Element","logFC","p.val"))
+exon_shuf$fdr <- p.adjust(exon_shuf$p.val,method = "fdr")
+exon_shuf <- full_join(exon_shuf,fread("../../../code/mpra_tools/fullannotationtable.txt"))[,!c("Pos","Ref","Alt","Type","Pheno","library_seq_alt","library_seq_shuf")]
+fwrite(exon_shuf,"Post-Splicing_RefvsShuf_Welchs.tsv")
+```
+
+### Stability Ref vs. Shuf
+```{r stability_refshuf}
+# Stability
+# Join tables
+stab_table <- as.data.table(inner_join(filter(d,Fraction=="0hr",Splicing=="pre"),
+                         filter(d,Fraction=="0hr",Splicing=="post"),
+                         by=c("Element","Allele","BiolRep","Fraction")))
+stab_table[,Expression := Expression.y-Expression.x]
+nulls <- as.data.table(filter(stab_table,Allele=="shuf") %>% group_by(Element) %>%
+    summarize(Expression=mean(Expression)))
+stab_shuf <- lapply(elements, function(element) {
+  welch_shuftest(data_table = stab_table, element = element, allele = "ref",null_values=nulls$Expression)
+})
+stab_shuf <- as.data.table(do.call(rbind,stab_shuf))
+setnames(stab_shuf,,c("Element","logFC","p.val"))
+stab_shuf$fdr <- p.adjust(stab_shuf$p.val,method = "fdr")
+stab_shuf <- full_join(stab_shuf,fread("../../../code/mpra_tools/fullannotationtable.txt"))[,!c("Pos","Ref","Alt","Type","Pheno","library_seq_alt","library_seq_shuf")]
+fwrite(stab_shuf,"Stability_RefvsShuf_Welchs.tsv")
+```
+
+## Reference vs. Variant
+### Linear Model on Pre- and Post-Splicing Ref vs Alt
+```{r pre_refvsalt}
+#Let's look at the post-only and pre-only ref/alt allele effects and correlate them
+pre <- as.data.table(table(filter(d_new,Fraction=="0hr",Splicing=="pre", Counts>49)[,c("Element","Allele")]))
+pre <- pivot_wider(pre,1,names_from = "Allele",values_from = "N")
+pre <- filter(pre,alt>2,ref>2)
+post <- as.data.table(table(filter(d_new,Fraction=="0hr",Splicing=="post", Counts>49)[,c("Element","Allele")]))
+post <- pivot_wider(post,1,names_from = "Allele",values_from = "N")
+post <- filter(post,alt>2,ref>2)
+elements <- list(pre$Element,post$Element) %>% purrr::reduce(intersect)
+
+post_res <- mpratools.lm(filter(d_new,Fraction=="0hr",Splicing=="post",Element %in% elements),
+                             Expression ~ Allele)
+pre_res <- mpratools.lm(filter(d_new,Fraction=="0hr",Splicing=="pre", Element %in% elements),
+                             Expression ~ Allele)
+post_res <- left_join(post_res,fread("../../../code/mpra_tools/fullannotationtable.txt"))
+fwrite(post_res,"PostSplicing_RefAlt_LM.txt",sep="\t")
+pre_res <- left_join(pre_res,fread("../../../code/mpra_tools/fullannotationtable.txt"))
+fwrite(pre_res,"PreSplicing_RefAlt_LM.txt",sep="\t")
+```
+
+### Linear Interaction Models on Pre/Post t0
+```{r run_LMs, include=FALSE}
+#Remove offending biolreps from list based on PCA and correlation heatmap
+d_new <- filter(d,
+            !(Splicing=="pre" & BiolRep==3),
+            !(Fraction=="11hr" & BiolRep==2))
+#Get new list of elements to test, knowing that 0hr Pre 3 and 11 hr post 2 are excluded
+# Generate lists of elements to test by counting number of times the element appears
+# (had an expression value calculated for how many biolreps)
+pre <- as.data.table(table(filter(d_new,Fraction=="0hr",Splicing=="pre", Counts>49)[,c("Element","Allele")]))
+pre <- pivot_wider(pre,1,names_from = "Allele",values_from = "N")
+pre <- filter(pre,alt>2,ref>2)
+post <- as.data.table(table(filter(d_new,Fraction=="0hr",Splicing=="post", Counts>49)[,c("Element","Allele")]))
+post <- pivot_wider(post,1,names_from = "Allele",values_from = "N")
+post <- filter(post,alt>2,ref>2)
+five <- as.data.table(table(filter(d_new,Fraction=="5hr",Splicing=="post", Counts>49)[,c("Element","Allele")]))
+five <- pivot_wider(five,1,names_from = "Allele",values_from = "N")
+five <- filter(five,alt>2,ref>2)
+eleven <- as.data.table(table(filter(d_new,Fraction=="11hr",Splicing=="post", Counts>49)[,c("Element","Allele")]))
+eleven <- pivot_wider(eleven,1,names_from = "Allele",values_from = "N")
+eleven <- filter(eleven,alt>2,ref>2)
+library(purrr)
+library(dplyr)
+elements <- list(pre$Element,post$Element,five$Element,eleven$Element) %>% purrr::reduce(intersect)
+#That's a lot, good.
+
+stability <- mpratools.lm.int( 
+  filter(d_new,Fraction=="0hr",Element %in% elements),
+  Expression ~ Allele * Splicing
+)
+
+stability <- left_join(stability,fread("../../../code/mpra_tools/fullannotationtable.txt"))
+fwrite(stability,"Stability_RefAlt_LM.txt",sep="\t")
+```
+
+## ActinomycinD Allelic Ratios
+### Allelic Ratio vs Time Modeling For t0 to t5
+```{r actd_allelic_ratio}
+# The data are super noisy.  Try allelic ratio at each time point like this:
+# 1)Calculate the Allelic Ratio within each time point - t0_rt = log2(Variant_t0/reference_t0)
+#   and t5 = log2(Variant_t5/Reference_t5)
+# 2)Calculate the change in ratio delta_rt = t5_rt - t0_rt
+# By using the Reference allele as the internal control for each variant within 
+# the same tube, you bypass all the total-pool-shrinkage issues.
+# Do this on counts only, NOT CPM, across biolreps.  Then the LM will be like
+# AllelicRatio ~ Time, or even AllelicRatio ~ Time + (1 | BiolRep-Time)
+
+Actd_Ratio <- pivot_wider(
+  filter(d,
+         Fraction %in% c("0hr","5hr"),
+         Splicing=="post",!Allele %in% c("shuf","shuf2")),
+  id_cols = c("Element","BiolRep"),
+  names_from = c("Fraction","Allele"),
+  values_from = "Counts")
+
+# Eliminate rows that had a count less than 49 anywhere
+Actd_Ratio <- as.data.table(Actd_Ratio %>%
+  filter(if_all(3:6, ~ .x > 49)))
+
+#Get a list of elements to test
+elements <- filter(
+  as.data.table(table(Actd_Ratio$Element)),
+  N>2)$V1
+
+Actd_Ratio <- filter(Actd_Ratio,Element %in% elements)
+
+# 3769, good
+
+Actd_Ratio[, Log2Ratio_T0 := log2(`0hr_alt`/`0hr_ref`)]
+Actd_Ratio[, Log2Ratio_T5 := log2(`5hr_alt`/`5hr_ref`)]
+
+#Now put it in long format for testing
+Actd_Ratio <- as.data.table(pivot_longer(
+  Actd_Ratio[,c(1,2,7,8)],
+  cols = 3:4,
+  names_to = "Time",
+  values_to = "Log2Ratio"))
+
+#Make the Time a Factor
+Actd_Ratio[,Time := as.factor(Time)]
+
+# Run the model for every element
+Actd_Ratio_Results <- Actd_Ratio %>%
+  group_by(Element) %>%
+  do(tidy(lm(Log2Ratio ~ Time, data = .))) %>%
+  ungroup() %>%
+  # Filter for the Time coefficient (the difference of means)
+  filter(term == "TimeLog2Ratio_T5") %>%
+  # Clean up the output
+  select(Element, 
+         Delta_Log2Ratio = estimate, 
+         p_value = p.value, 
+         std_error = std.error) %>%
+  # Add Adjusted P-values for multiple testing
+  mutate(fdr = p.adjust(p_value, method = "BH"))
+
+# Sort by the most significant stability changes
+Actd_Ratio_Results <- Actd_Ratio_Results %>% arrange(p_value)
+
+Actd_Ratio_Results <- left_join(Actd_Ratio_Results,fread("../../../code/mpra_tools/fullannotationtable.txt"))
+fwrite(Actd_Ratio_Results,"ActD_Zero-to-Five_RefvsAlt_LM.tsv",sep="\t")
+```
+
+### Allelic Ratio vs Time Modeling For t0 to t11
+```{r t11_allelic_ratio}
+
+Actd_Ratio <- as.data.table(pivot_wider(
+  filter(d,Fraction %in% c("0hr","11hr"),
+         Splicing=="post",
+         !Allele %in% c("shuf","shuf2"),
+         !(Fraction=="11hr" & BiolRep==2)),
+  id_cols = c("Element","BiolRep"),
+  names_from = c("Fraction","Allele"),
+  values_from = "Counts"))
+
+# Eliminate rows that had a count less than 49 anywhere
+Actd_Ratio <- as.data.table(Actd_Ratio %>%
+  filter(if_all(3:6, ~ .x > 49)))
+
+#Get a list of elements to test
+elements <- filter(
+  as.data.table(table(Actd_Ratio$Element)),
+  N>2)$V1
+
+# 3767, still really good
+
+Actd_Ratio <- filter(Actd_Ratio,Element %in% elements)
+
+Actd_Ratio[, Log2Ratio_T0 := log2(`0hr_alt`/`0hr_ref`)]
+Actd_Ratio[, Log2Ratio_T11 := log2(`11hr_alt`/`11hr_ref`)]
+
+#Now put it in long format for testing
+Actd_Ratio <- as.data.table(pivot_longer(
+  Actd_Ratio[,c(1,2,7:8)],
+  cols = 3:4,
+  names_to = "Time",
+  values_to = "Log2Ratio"))
+
+#Make the Time a Factor
+Actd_Ratio[,Time := as.factor(Time)]
+
+# Run the model for every element
+Actd_Ratio_Results_0to11 <- Actd_Ratio %>%
+  group_by(Element) %>%
+  do(tidy(lm(Log2Ratio ~ Time, data = .))) %>%
+  ungroup() %>%
+  # Filter for the Time coefficient (the difference of means)
+  filter(term == "TimeLog2Ratio_T11") %>%
+  # Clean up the output
+  select(Element, 
+         Delta_Log2Ratio = estimate, 
+         p_value = p.value, 
+         std_error = std.error) %>%
+  # Add Adjusted P-values for multiple testing
+  mutate(fdr = p.adjust(p_value, method = "BH"))
+
+# Sort by the most significant stability changes
+Actd_Ratio_Results_0to11 <- Actd_Ratio_Results_0to11 %>% arrange(p_value)
+Actd_Ratio_Results_0to11 <- left_join(Actd_Ratio_Results_0to11,fread("../../../code/mpra_tools/fullannotationtable.txt"))
+fwrite(Actd_Ratio_Results_0to11,"ActD_Zero-to-Eleven_RefvsAlt_LM.tsv",sep="\t")
+```
+
+##Plotting ISOMPRA Stability Log2FC Against Allelic Ratio for Significant Variants
+```{r Plots}
+
+Actd_Ratio_Results <- fread("./ActD_Zero-to-Five_RefvsAlt_LM.tsv")
+Actd_Ratio_Results_0to11 <- fread("./ActD_Zero-to-Eleven_RefvsAlt_LM.tsv")
+stability <- fread("./Stability_RefAlt_LM.txt")
+
+full <- list(
+  Actd_Ratio_Results[, c(1, 2, 3, 5, 17)],
+  Actd_Ratio_Results_0to11[, c(1, 2, 3, 5, 17)],
+  stability[, c(1:12, 25)]
+) %>% 
+  purrr::reduce(~ left_join(.x, .y, by = c("Element", "Symbol")))
+
+#Filter for variants that were nominally significant in both t0:t5 and t0:t11
+elements <- list(
+           filter(full,
+                  abs(p_value.x)<0.05,
+                  abs(p_value.y)<0.05)$Element
+         ) %>% purrr::reduce(intersect)
+
+truedecay <- filter(full, Element %in% elements)
+
+zerofivestat <- cor.test(
+  truedecay$Delta_Log2Ratio.x,
+  -truedecay$logFC_interaction,
+  method = "spearman")
+
+zeroelevenstat <- cor.test(
+  truedecay$Delta_Log2Ratio.y,
+  -truedecay$logFC_interaction,
+  method = "spearman")
+
+xlims <- c(min(truedecay$logFC_interaction),max(truedecay$logFC_interaction))
+ylims <- c(
+  min(
+    min(truedecay$Delta_Log2Ratio.x),min(truedecay$Delta_Log2Ratio.y)),
+  max(
+    max(truedecay$Delta_Log2Ratio.x),max(truedecay$Delta_Log2Ratio.y))
+  )
+
+p1 <- ggplot(truedecay, aes(x = -logFC_interaction, y = Delta_Log2Ratio.x)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", color = "blue", se = FALSE) +
+  labs(x="ISOMPRA log2FC",
+       y="ActD Allelic Ratio log2FC 0hr to 5hr")+
+  theme(plot.title=element_text(hjust=0.5))+
+  geom_vline(xintercept = 0)+
+  geom_hline(yintercept = 0)+
+  geom_label_repel(aes(label=Symbol))+
+  annotate("label", x = -1, y = 1.5,
+           label = paste0("rho == ", round(zerofivestat$estimate, 2), 
+                          " ~~~ p == ", round(zerofivestat$p.value, 4)),
+           parse = TRUE)+
+  xlim(-2,2)+
+  ylim(-2,2)
+print(p1)
+
+p2 <- ggplot(truedecay, aes(x = -logFC_interaction, y = Delta_Log2Ratio.y)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", color = "blue", se = FALSE) +
+  labs(x="ISOMPRA log2FC",
+       y="ActD Allelic Ratio log2FC 0hr to 11hr")+
+  theme(plot.title=element_text(hjust=0.5))+
+  geom_vline(xintercept = 0)+
+  geom_hline(yintercept = 0)+
+  geom_label_repel(aes(label=Symbol))+
+  annotate("label", x = -1, y = 1.5,
+           label = paste0("rho == ", round(zeroelevenstat$estimate, 2), 
+                          " ~~~ p == ", round(zeroelevenstat$p.value, 4)),
+           parse = TRUE)+
+  xlim(-2,2)+
+  ylim(-2,2)
+print(p2)
+
+#Place this is Figure S7 of the figure_making folder
+dir.create("../../../figure_making/Figures/")
+dir.create("../../../figure_making/Figures/Figure_S7")
+export_graph_start("../../../figure_making/Figures/Figure_S7/ActD logFC vs ISOMPRA logFC.pdf",sideways = TRUE,width = 2,height=1.5)
+combined_plot <- p1+p2
+combined_plot +
+  plot_annotation(
+    title = 'ActinomycinD Log2(Allelic Ratio) Analysis',
+    subtitle = 'Comparing 0hr-5hr vs 0hr-11hr logFCs against ISOMPRA logFC',
+    theme = theme(plot.title = element_text(size = 18, hjust = 0.5, face = "bold"),
+                  plot.subtitle = element_text(size = 18, hjust = 0.5))
+  )
+export_graph_end()
+
+
+
+```
+
+##Individual BoxPlots of Selected Variants
+```{r boxplots}
+# Plot Individual Boxplots for variants with spike-in counts added
+# Spike-in Counts were not necessary for the allelic ratio/pre-post analyses
+
+d <- fread("../../../data/formatted/ActD_Trials_08Apr2026/formatted.txt")
+
+d <- d %>%
+  separate_wider_regex(
+    cols = Element,
+    patterns = c(
+      Element = ".*",        # Match as much as possible (greedy)
+      "_",                   # Match the last underscore
+      Allele = "[^_]+"       # Match everything remaining that isn't an underscore
+    )
+  )
+d <- as.data.table(d)
+
+controls <- fread("./counts_report.txt")
+sampleguide <- fread("./Samplemap.csv")
+controls <- left_join(controls,sampleguide[,c(1,10)],join_by("Filename"=="FASTQ"))
+
+setnames(controls,,c("Filename","PRE_mut","SRE_mut","Library"))
+controls$Library <- str_replace_all(controls$Library, "((5hr|11hr)_[0-9]+)", "\\1_post")
+controls <- controls[,2:4]
+controls <- pivot_longer(controls,1:2,names_to = "Element", values_to = "Counts")
+controls <- separate(controls,Library,c("Fraction","BiolRep","Splicing"))
+controls$BiolRep <- as.numeric(controls$BiolRep)
+d_wcontrols <- bind_rows(controls,d)
+d_wcontrols <- d_wcontrols %>% group_by(Fraction,BiolRep,Splicing) %>% mutate(CPM=(Counts/sum(Counts))*1e6)
+#Grab the DNA info
+dna <- fread("../../../data/formatted/Library1and2BCLess_ISOMPRA_6-30-2022/formatted_Reads_compiled_06-30-2022.tsv") %>% filter(Fraction=="DNA")
+dna <- dna %>% group_by(Element,Allele) %>% summarize(CPM=mean(CPM)) %>% as.data.table()
+#Put the DNA info in the table, adjoining to correct element
+d_wcontrols <- as.data.table(left_join(d_wcontrols,dna,by=c("Element","Allele")))
+#Calculate expression
+d_wcontrols[, Expression := log2(CPM.x/CPM.y)]
+#Get rid of non-finite values
+d_wcontrols <- filter(d_wcontrols,is.finite(Expression))
+
+export_graph_start("../../../figure_making/Figures/Figure_S7/Boxplots for Truedecay_withSpikeIn.pdf",width=1.5,sideways = TRUE)
+for (i in 1:nrow(truedecay)){
+  # Separate these into ISOMPRA plots first, then ActD
+  df <- as.data.table(filter(d_wcontrols,
+                             Element == truedecay$Element[i],
+                             Fraction == "0hr",
+                             Allele %in% c("ref","alt")
+                      ))
+  df[,Allele := factor(Allele,levels = c("ref","alt"),
+                         labels=c("Reference","Variant"))]
+  df[,Splicing := factor(Splicing,levels = c("pre","post"),
+                         labels=c("Pre-Splicing","Post-Splicing"))]
+  p1 <- ggplot(df, aes(x = Splicing, y = Expression, color = Allele)) +
+    # 1. Boxplots grouped by BOTH Allele and Splicing
+    geom_boxplot(aes(group = interaction(Splicing, Allele)), 
+                 position = position_dodge(width = 0.8), outlier.shape = NA) + 
+    
+    # 2. Points grouped by BOTH (to match the dodge)
+    geom_point(aes(group = interaction(Splicing, Allele)), 
+               position = position_dodge(width = 0.8), alpha = 0.5) +
+    
+    # 3. The Line grouped ONLY by Allele (to bridge the Splicing gap)
+    stat_summary(aes(group = Allele), 
+                 fun = median, geom = "line", 
+                 position = position_dodge(width = 0.8), 
+                 linewidth = 1) +
+    
+    labs(title = "ISOMPRA Profile",
+         y = "log2(RNA/DNA)") +
+    theme(plot.title = element_text(hjust=0.5))
+  # Now the ActD
+  df <- as.data.table(filter(d_wcontrols,
+                             Element == truedecay$Element[i],
+                             Splicing == "post",
+                             Allele %in% c("ref","alt"),
+                             !(Fraction=="11hr" & BiolRep==2),
+                             !(Fraction=="0hr" & BiolRep==3 & Splicing=="post")
+                             
+                      ))
+  df[,Allele := factor(Allele,levels = c("ref","alt"),
+                         labels=c("Reference","Variant"))]
+  df[,Time := factor(Fraction,levels = c("0hr","5hr","11hr"),
+                         labels=c("t0","t5","t11"))]
+  p2 <- ggplot(df, aes(x = Time, y = Expression, color = Allele)) +
+    # 1. Boxplots grouped by BOTH Allele and Splicing
+    geom_boxplot(aes(group = interaction(Time, Allele)), 
+                 position = position_dodge(width = 0.8), outlier.shape = NA) + 
+    
+    # 2. Points grouped by BOTH (to match the dodge)
+    geom_point(aes(group = interaction(Time, Allele)), 
+               position = position_dodge(width = 0.8), alpha = 0.5) +
+    
+    # 3. The Line grouped ONLY by Allele (to bridge the Splicing gap)
+    stat_summary(aes(group = Allele), 
+                 fun = median, geom = "line", 
+                 position = position_dodge(width = 0.8), 
+                 linewidth = 1) +
+    
+    labs(title = "Actinomycin D Profile",
+         y = "log2(RNA/DNA)") +
+    theme(plot.title = element_text(hjust=0.5))
+  
+  combined_plot <- p1+p2
+  
+  print(combined_plot + 
+    plot_annotation(
+      title = truedecay$Symbol[i],
+      subtitle = truedecay$Element[i],
+      theme = theme(
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 24),
+        plot.subtitle = element_text(hjust = 0.5, size = 18)
+      )
+    )
+  )
+  
+
+}
+export_graph_end()
+
+```
+
+## Investigating ActD Nominally Signficant Case Enrichment
+```{r}
+zero_to_five <- fread("./ActD_Zero-to-Five_RefvsAlt_LM.tsv")
+zero_to_eleven <- fread("./ActD_Zero-to-Eleven_RefvsAlt_LM.tsv")
+
+# 1. Get total counts of elements designed in your library per Phenotype group
+# (Replace 'zero_to_five' with your actual data table variable name)
+total_cases    <- length(zero_to_five[Pheno == "case"]$Element)
+total_controls <- length(zero_to_five[Pheno == "control"]$Element)
+
+# 2. Calculate the non-significant background
+sig_cases   <- length(zero_to_five[Pheno == "case" & p_value<0.05]$Element)
+sig_controls <- length(zero_to_five[Pheno == "control" & p_value<0.05]$Element)
+
+nonsig_cases    <- total_cases - sig_cases
+nonsig_controls <- total_controls - sig_controls
+
+# 3. Build the 2x2 contingency table
+contingency_matrix_ActD <- matrix(
+  c(sig_cases, nonsig_cases,  # Cases (Sig, NonSig)
+    sig_controls,  nonsig_controls), # Controls (Sig, NonSig)
+  nrow = 2, byrow = TRUE,
+  dimnames = list(Pheno = c("Case", "Control"),
+                  Significance = c("Sig", "NonSig"))
+)
+
+fisher.test(contingency_matrix_ActD, alternative = "greater")
+
+#Also rerun on pre- and post-splice
+pre <- fread("./PreSplicing_RefAlt_LM.txt")
+post <- fread("./PostSplicing_RefAlt_LM.txt")
+stab <- fread("./Stability_RefAlt_LM.txt")
+# 1. Get total counts of elements designed in your library per Phenotype group
+# (Replace 'zero_to_five' with your actual data table variable name)
+total_cases    <- length(pre[Pheno == "case"]$Element)
+total_controls <- length(pre[Pheno == "control"]$Element)
+
+# 2. Calculate the non-significant background
+sig_cases   <- length(pre[Pheno == "case" & fdr<0.1]$Element)
+sig_controls <- length(pre[Pheno == "control" & fdr<0.1]$Element)
+
+nonsig_cases    <- total_cases - sig_cases
+nonsig_controls <- total_controls - sig_controls
+
+# 3. Build the 2x2 contingency table
+contingency_matrix_pre <- matrix(
+  c(sig_cases, nonsig_cases,  # Cases (Sig, NonSig)
+    sig_controls,  nonsig_controls), # Controls (Sig, NonSig)
+  nrow = 2, byrow = TRUE,
+  dimnames = list(Pheno = c("Case", "Control"),
+                  Significance = c("Sig", "NonSig"))
+)
+
+fisher.test(contingency_matrix_pre, alternative = "greater")
+
+# 1. Get total counts of elements designed in your library per Phenotype group
+# (Replace 'zero_to_five' with your actual data table variable name)
+total_cases    <- length(post[Pheno == "case"]$Element)
+total_controls <- length(post[Pheno == "control"]$Element)
+
+# 2. Calculate the non-significant background
+sig_cases   <- length(post[Pheno == "case" & fdr<0.1]$Element)
+sig_controls <- length(post[Pheno == "control" & fdr<0.1]$Element)
+
+nonsig_cases    <- total_cases - sig_cases
+nonsig_controls <- total_controls - sig_controls
+
+# 3. Build the 2x2 contingency table
+contingency_matrix_post <- matrix(
+  c(sig_cases, nonsig_cases,  # Cases (Sig, NonSig)
+    sig_controls,  nonsig_controls), # Controls (Sig, NonSig)
+  nrow = 2, byrow = TRUE,
+  dimnames = list(Pheno = c("Case", "Control"),
+                  Significance = c("Sig", "NonSig"))
+)
+
+fisher.test(contingency_matrix_post, alternative = "greater")
+
+# 1. Get total counts of elements designed in your library per Phenotype group
+# (Replace 'zero_to_five' with your actual data table variable name)
+total_cases    <- length(stab[Pheno == "case"]$Element)
+total_controls <- length(stab[Pheno == "control"]$Element)
+
+# 2. Calculate the non-significant background
+sig_cases   <- length(stab[Pheno == "case" & fdr_allele<0.1 & fdr_interaction>0.1]$Element)
+sig_controls <- length(stab[Pheno == "control" & fdr_allele<0.1 & fdr_interaction>0.1]$Element)
+
+nonsig_cases    <- total_cases - sig_cases
+nonsig_controls <- total_controls - sig_controls
+
+# 3. Build the 2x2 contingency table
+contingency_matrix_stab <- matrix(
+  c(sig_cases, nonsig_cases,  # Cases (Sig, NonSig)
+    sig_controls,  nonsig_controls), # Controls (Sig, NonSig)
+  nrow = 2, byrow = TRUE,
+  dimnames = list(Pheno = c("Case", "Control"),
+                  Significance = c("Sig", "NonSig"))
+)
+
+fisher.test(contingency_matrix_stab, alternative = "greater")
+
+
+```
+

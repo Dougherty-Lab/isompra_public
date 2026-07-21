@@ -1,0 +1,66 @@
+ ---
+title: "ISOMPRA Controls for Reviews"
+author: "Anthony Fischer"
+date: "2025-06-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=FALSE}
+source("../../code/mpra_tools/mpra_tools.R")
+library(ggsignif)
+library(fplot)
+```
+
+## Reading in Data
+```{r read_data}
+d <- fread("../../data/formatted/Library1_plus_Controls_forPaper_FullRun_31Jul2025/compiled_31Jul2025.txt")
+d_avg <- filter(d,Fraction=="DNA")
+d_avg <- d_avg %>% group_by(Element) %>% summarize(CPM=mean(CPM))
+d_exp <- filter(d,Fraction!="DNA")
+d_exp <- as.data.table(left_join(d_exp,d_avg,"Element"))
+d_exp <- as.data.table(d_exp[,Expression := log2(CPM.x/CPM.y)])
+d_exp <- tidyr::separate(d_exp,Element,c("Element","Library","Allele"),sep="_")
+d_exp <- tidyr::unite(d_exp,"Element",c("Element","Library"))
+d_exp <- as.data.table(left_join(
+  filter(d_exp,Fraction=="Post"),
+  filter(d_exp,Fraction=="Pre"),
+  c("Element","BiolRep","Allele")
+))
+d_exp[,Stability := Expression.x-Expression.y]
+```
+
+## Performing Linear Modeling on Post-Pre Values
+```{r modeling}
+
+res <- mpratools.lm(filter(d_exp,is.finite(Stability)),Stability~Allele)
+
+```
+
+## Plotting Pumilio and Smaug Control vs. Mutated Boxplots
+```{r boxplots}
+d_exp_ctls <- filter(d_exp, Element %in% c("PRE_ctl", "SRE_ctl"), is.finite(Stability))
+d_exp_ctls$Allele <- factor(d_exp_ctls$Allele,levels=c("ref","alt"),labels = c("Control","Mutated"))
+d_exp_ctls$Element <- factor(d_exp_ctls$Element,levels=c("PRE_ctl","SRE_ctl"),
+                             labels = c("Pumilio Response Element","Smaug Response Element"))
+
+#We'll place this in Figure 2's files
+
+dir.create("../../figure_making/Figures")
+dir.create("../../figure_making/Figures/Figure_2")
+
+export_graph_start("../../figure_making/Figures/Figure_2/Control_Element_Boxplot_fig2N.pdf",sideways = TRUE)
+ggplot(d_exp_ctls,aes(x = Allele, y = Stability, fill = Allele)) +
+  geom_boxplot() +
+  geom_point(shape = 21, position = position_jitter(width = 0.1)) +
+  geom_signif(comparisons = list(c("Control", "Mutated"))) +
+  facet_wrap(~Element)+
+  theme(legend.position = "none")
+export_graph_end()
+```
+
+
+
